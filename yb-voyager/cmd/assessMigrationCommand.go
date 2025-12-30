@@ -61,7 +61,7 @@ var (
 	sourceReadReplicaEndpoints       string                              // CLI flag - package variable for Cobra binding
 	primaryOnly                      bool                                // CLI flag - package variable for Cobra binding
 	replicaDiscoveryInfoForCallhome  *migassessment.ReplicaDiscoveryInfo // Stored for error callhome
-	includeLobSizeStatistics         bool                                // CLI flag - controls whether LOB size statistics appear in assessment report
+	includeLobSizeStatistics         utils.BoolStr                       // CLI flag - controls whether LOB size statistics appear in assessment report
 )
 
 var sourceConnectionFlags = []string{
@@ -602,7 +602,7 @@ func gatherAssessmentMetadata(validatedReplicas []srcdb.ReplicaEndpoint) error {
 			return fmt.Errorf("error gathering metadata and stats from source PG database: %w", err)
 		}
 	case ORACLE:
-		err := migassessment.GatherAssessmentMetadataFromOracle(&source, assessmentMetadataDir, includeLobSizeStatistics)
+		err := migassessment.GatherAssessmentMetadataFromOracle(&source, assessmentMetadataDir, bool(includeLobSizeStatistics))
 		if err != nil {
 			return fmt.Errorf("error gathering metadata and stats from source Oracle database: %w", err)
 		}
@@ -1347,7 +1347,7 @@ func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []ut
 	var unsupportedDataTypes, unsupportedDataTypesForLiveMigration, unsupportedDataTypesForLiveMigrationWithFForFB []utils.TableColumnsDataTypes
 
 	var query string
-	if includeLobSizeStatistics {
+	if bool(includeLobSizeStatistics) {
 		// Join with LOB column sizes to get size statistics for BLOB/CLOB columns
 		query = fmt.Sprintf(`SELECT 
 			tcdt.schema_name, 
@@ -1387,7 +1387,7 @@ func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []ut
 	var allColumnsDataTypes []utils.TableColumnsDataTypes
 	for rows.Next() {
 		var columnDataTypes utils.TableColumnsDataTypes
-		if includeLobSizeStatistics {
+		if bool(includeLobSizeStatistics) {
 			var minSize, maxSize, avgSize, nonNullCount sql.NullInt64
 			err := rows.Scan(&columnDataTypes.SchemaName, &columnDataTypes.TableName,
 				&columnDataTypes.ColumnName, &columnDataTypes.DataType,
