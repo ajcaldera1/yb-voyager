@@ -572,6 +572,11 @@ func (ora *Oracle) GetColumnsWithSupportedTypes(tableList []sqlname.NameTuple, u
 		// If allow-oracle-clob-data-export is true, then CLOB needs to be included in the export and removed from the unsupported data types list
 		OracleUnsupportedDataTypes = lo.Without(OracleUnsupportedDataTypes, "CLOB")
 	}
+	if bool(ora.source.AllowOracleBlobDataExport) {
+		// The flag won't be allowed for live/BETA_FAST_DATA_EXPORT export paths
+		// If allow-oracle-blob-data-export is true, then BLOB needs to be included in the export and removed from the unsupported data types list
+		OracleUnsupportedDataTypes = lo.Without(OracleUnsupportedDataTypes, "BLOB")
+	}
 	for _, tableName := range tableList {
 		columns, dataTypes, dataTypesOwner, err := ora.getTableColumns(tableName)
 		if err != nil {

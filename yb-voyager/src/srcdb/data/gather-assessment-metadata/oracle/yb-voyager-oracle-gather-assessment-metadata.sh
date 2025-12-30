@@ -198,8 +198,19 @@ main() {
     oracle_connection_string=$(quote_string "$oracle_connection_string")
     
     print_and_log "INFO" "Assessment metadata collection started for '$schema_name' schema"
+    
+    # Check if LOB size statistics should be included
+    INCLUDE_LOB_SIZE_STATISTICS="${INCLUDE_LOB_SIZE_STATISTICS:-false}"
+    
     for script in $SCRIPT_DIR/*.sqlplus; do # Loop through each SQLPlus script and execute it
         script_name=$(basename "$script" .sqlplus)
+        
+        # Skip LOB size statistics script if flag is false
+        if [ "$script_name" = "lob-column-sizes" ] && [ "$INCLUDE_LOB_SIZE_STATISTICS" != "true" ]; then
+            log "INFO" "Skipping $script_name collection (INCLUDE_LOB_SIZE_STATISTICS=false)"
+            continue
+        fi
+        
         script_action=$(basename "$script" .sqlplus | sed 's/-/ /g')
         csv_file_path="$assessment_metadata_dir/${script_name%.sqlplus}.csv"
         print_and_log "INFO" "Collecting $script_action..."

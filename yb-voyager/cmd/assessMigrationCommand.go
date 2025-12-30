@@ -17,6 +17,7 @@ limitations under the License.
 package cmd
 
 import (
+	"database/sql"
 	_ "embed"
 	"encoding/json"
 	"errors"
@@ -60,6 +61,7 @@ var (
 	sourceReadReplicaEndpoints       string                              // CLI flag - package variable for Cobra binding
 	primaryOnly                      bool                                // CLI flag - package variable for Cobra binding
 	replicaDiscoveryInfoForCallhome  *migassessment.ReplicaDiscoveryInfo // Stored for error callhome
+	includeLobSizeStatistics         bool                                // CLI flag - controls whether LOB size statistics appear in assessment report
 )
 
 var sourceConnectionFlags = []string{
@@ -203,6 +205,9 @@ func init() {
 	assessMigrationCmd.Flags().StringVar(&sourceReadReplicaEndpoints, "source-read-replica-endpoints", "",
 		"Comma-separated list of read replica endpoints. Each endpoint is host:port. Default port 5432. "+
 			"Example: \"host1:5432, host2:5433\". (only valid for PostgreSQL)")
+
+	BoolVar(assessMigrationCmd.Flags(), &includeLobSizeStatistics, "include-lob-size-statistics", false,
+		"Include minimum, maximum, and average size statistics for BLOB and CLOB columns in the assessment report. (default false)")
 
 	assessMigrationCmd.Flags().BoolVar(&primaryOnly, "primary-only", false,
 		"assess only the primary database, skip read replica discovery and assessment (only valid for PostgreSQL).")
@@ -597,7 +602,7 @@ func gatherAssessmentMetadata(validatedReplicas []srcdb.ReplicaEndpoint) error {
 			return fmt.Errorf("error gathering metadata and stats from source PG database: %w", err)
 		}
 	case ORACLE:
-		err := migassessment.GatherAssessmentMetadataFromOracle(&source, assessmentMetadataDir)
+		err := migassessment.GatherAssessmentMetadataFromOracle(&source, assessmentMetadataDir, includeLobSizeStatistics)
 		if err != nil {
 			return fmt.Errorf("error gathering metadata and stats from source Oracle database: %w", err)
 		}
@@ -1341,8 +1346,33 @@ func fetchUnsupportedQueryConstructs() ([]utils.UnsupportedQueryConstruct, error
 func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []utils.TableColumnsDataTypes, []utils.TableColumnsDataTypes, error) {
 	var unsupportedDataTypes, unsupportedDataTypesForLiveMigration, unsupportedDataTypesForLiveMigrationWithFForFB []utils.TableColumnsDataTypes
 
-	query := fmt.Sprintf(`SELECT schema_name, table_name, column_name, data_type FROM %s`,
-		migassessment.TABLE_COLUMNS_DATA_TYPES)
+	var query string
+	if includeLobSizeStatistics {
+		// Join with LOB column sizes to get size statistics for BLOB/CLOB columns
+		query = fmt.Sprintf(`SELECT 
+			tcdt.schema_name, 
+			tcdt.table_name, 
+			tcdt.column_name, 
+			tcdt.data_type,
+			lcs.min_size_bytes,
+			lcs.max_size_bytes,
+			lcs.avg_size_bytes,
+			lcs.non_null_count
+		FROM %s tcdt
+		LEFT JOIN %s lcs ON 
+			tcdt.schema_name = lcs.schema_name AND 
+			tcdt.table_name = lcs.table_name AND 
+			tcdt.column_name = lcs.column_name AND
+			tcdt.source_node = lcs.source_node
+		WHERE tcdt.source_node = 'primary'`,
+			migassessment.TABLE_COLUMNS_DATA_TYPES,
+			migassessment.LOB_COLUMN_SIZES)
+	} else {
+		// Simple query without LOB size statistics
+		query = fmt.Sprintf(`SELECT schema_name, table_name, column_name, data_type FROM %s WHERE source_node = 'primary'`,
+			migassessment.TABLE_COLUMNS_DATA_TYPES)
+	}
+
 	rows, err := assessmentDB.Query(query)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("error querying-%s on assessmentDB: %w", query, err)
@@ -1357,10 +1387,34 @@ func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []ut
 	var allColumnsDataTypes []utils.TableColumnsDataTypes
 	for rows.Next() {
 		var columnDataTypes utils.TableColumnsDataTypes
-		err := rows.Scan(&columnDataTypes.SchemaName, &columnDataTypes.TableName,
-			&columnDataTypes.ColumnName, &columnDataTypes.DataType)
-		if err != nil {
-			return nil, nil, nil, fmt.Errorf("error scanning rows: %w", err)
+		if includeLobSizeStatistics {
+			var minSize, maxSize, avgSize, nonNullCount sql.NullInt64
+			err := rows.Scan(&columnDataTypes.SchemaName, &columnDataTypes.TableName,
+				&columnDataTypes.ColumnName, &columnDataTypes.DataType,
+				&minSize, &maxSize, &avgSize, &nonNullCount)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("error scanning rows: %w", err)
+			}
+
+			// Populate size statistics if available
+			if minSize.Valid {
+				columnDataTypes.MinSizeBytes = &minSize.Int64
+			}
+			if maxSize.Valid {
+				columnDataTypes.MaxSizeBytes = &maxSize.Int64
+			}
+			if avgSize.Valid {
+				columnDataTypes.AvgSizeBytes = &avgSize.Int64
+			}
+			if nonNullCount.Valid {
+				columnDataTypes.NonNullCount = &nonNullCount.Int64
+			}
+		} else {
+			err := rows.Scan(&columnDataTypes.SchemaName, &columnDataTypes.TableName,
+				&columnDataTypes.ColumnName, &columnDataTypes.DataType)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("error scanning rows: %w", err)
+			}
 		}
 
 		allColumnsDataTypes = append(allColumnsDataTypes, columnDataTypes)

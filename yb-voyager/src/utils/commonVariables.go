@@ -144,13 +144,17 @@ type IndexInfo struct {
 }
 
 type TableColumnsDataTypes struct {
-	SchemaName  string `json:"SchemaName"`
-	TableName   string `json:"TableName"`
-	ColumnName  string `json:"ColumnName"`
-	DataType    string `json:"DataType"`
-	IsArrayType bool   `json:"-"`
-	IsEnumType  bool   `json:"-"`
-	IsUDTType   bool   `json:"-"`
+	SchemaName     string `json:"SchemaName"`
+	TableName      string `json:"TableName"`
+	ColumnName     string `json:"ColumnName"`
+	DataType       string `json:"DataType"`
+	IsArrayType    bool   `json:"-"`
+	IsEnumType     bool   `json:"-"`
+	IsUDTType      bool   `json:"-"`
+	MinSizeBytes   *int64 `json:"MinSizeBytes,omitempty"`
+	MaxSizeBytes   *int64 `json:"MaxSizeBytes,omitempty"`
+	AvgSizeBytes   *int64 `json:"AvgSizeBytes,omitempty"`
+	NonNullCount   *int64 `json:"NonNullCount,omitempty"`
 }
 
 func (colDatatype *TableColumnsDataTypes) GetBaseTypeNameFromDatatype() string {

@@ -66,6 +66,7 @@ type Source struct {
 	StrExcludeObjectTypeList  string        `json:"str_exclude_object_type_list"`
 	RunGuardrailsChecks       utils.BoolStr `json:"run_guardrails_checks"`
 	AllowOracleClobDataExport utils.BoolStr `json:"allow_oracle_clob_data_export"`
+	AllowOracleBlobDataExport utils.BoolStr `json:"allow_oracle_blob_data_export"`
 	IsYBGrpcConnector         bool          `json:"-"`
 
 	ExportObjectTypeList []string `json:"-"`

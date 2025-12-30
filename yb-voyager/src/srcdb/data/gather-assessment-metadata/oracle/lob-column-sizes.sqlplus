@@ -1,0 +1,111 @@
+SET ECHO OFF
+SET FEEDBACK OFF
+SET HEADING ON
+SET MARKUP CSV ON DELIMITER , QUOTE OFF
+SET PAGESIZE 0
+SET TRIMSPOOL ON
+SET TERMOUT OFF
+SET VERIFY OFF
+
+-- Exit on SQL errors or OS errors
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
+
+-- Create a temporary table to store LOB size statistics
+CREATE GLOBAL TEMPORARY TABLE temp_lob_sizes (
+    schema_name VARCHAR2(128),
+    table_name VARCHAR2(128),
+    column_name VARCHAR2(128),
+    data_type VARCHAR2(20),
+    min_size_bytes NUMBER,
+    max_size_bytes NUMBER,
+    avg_size_bytes NUMBER,
+    non_null_count NUMBER
+) ON COMMIT PRESERVE ROWS;
+
+-- Populate the temporary table using PL/SQL
+DECLARE
+    v_sql VARCHAR2(4000);
+    v_min_size NUMBER;
+    v_max_size NUMBER;
+    v_avg_size NUMBER;
+    v_count NUMBER;
+    v_schema_name VARCHAR2(128) := UPPER('&1');
+BEGIN
+    -- Loop through each BLOB/CLOB column
+    FOR col_rec IN (
+        SELECT
+            t.owner AS schema_name,
+            t.table_name,
+            c.column_name,
+            c.data_type
+        FROM
+            dba_tab_columns c
+        JOIN
+            dba_tables t ON c.owner = t.owner AND c.table_name = t.table_name
+        LEFT JOIN
+            dba_part_tables pt ON t.owner = pt.owner AND t.table_name = pt.table_name
+        WHERE
+            c.owner = v_schema_name
+            AND c.data_type IN ('BLOB', 'CLOB', 'NCLOB')
+            AND t.table_name NOT LIKE 'DR$%'
+            AND t.table_name NOT LIKE 'AQ$%'
+            AND COALESCE(pt.partitioning_type,'EMPTY') NOT IN ('SYSTEM', 'REFERENCE')
+        ORDER BY
+            t.owner, t.table_name, c.column_name
+    ) LOOP
+        -- Build dynamic SQL to calculate statistics
+        v_sql := 'SELECT 
+                    MIN(DBMS_LOB.GETLENGTH("' || col_rec.column_name || '")) AS min_size,
+                    MAX(DBMS_LOB.GETLENGTH("' || col_rec.column_name || '")) AS max_size,
+                    ROUND(AVG(DBMS_LOB.GETLENGTH("' || col_rec.column_name || '"))) AS avg_size,
+                    COUNT(*) AS non_null_count
+                  FROM "' || col_rec.schema_name || '"."' || col_rec.table_name || '"
+                  WHERE "' || col_rec.column_name || '" IS NOT NULL';
+        
+        BEGIN
+            EXECUTE IMMEDIATE v_sql INTO v_min_size, v_max_size, v_avg_size, v_count;
+            
+            -- Only insert if there are non-null values
+            IF v_count > 0 THEN
+                INSERT INTO temp_lob_sizes VALUES (
+                    col_rec.schema_name,
+                    col_rec.table_name,
+                    col_rec.column_name,
+                    col_rec.data_type,
+                    v_min_size,
+                    v_max_size,
+                    v_avg_size,
+                    v_count
+                );
+            END IF;
+        EXCEPTION
+            WHEN OTHERS THEN
+                -- Skip columns that can't be queried (e.g., permissions, empty tables)
+                NULL;
+        END;
+    END LOOP;
+    COMMIT;
+END;
+/
+
+-- Output the results to CSV
+SPOOL lob-column-sizes.csv
+SELECT 
+    schema_name,
+    table_name,
+    column_name,
+    data_type,
+    min_size_bytes,
+    max_size_bytes,
+    avg_size_bytes,
+    non_null_count
+FROM temp_lob_sizes
+ORDER BY schema_name, table_name, column_name;
+SPOOL OFF
+
+-- Clean up
+DROP TABLE temp_lob_sizes;
+
+EXIT;
+

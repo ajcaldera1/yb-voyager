@@ -337,6 +337,7 @@ func GatherAssessmentMetadataFromPG(
 func GatherAssessmentMetadataFromOracle(
 	source *srcdb.Source,
 	assessmentMetadataDir string,
+	includeLobSizeStatistics bool,
 ) error {
 	scriptPath, err := findGatherMetadataScriptPath(ORACLE)
 	if err != nil {
@@ -350,6 +351,7 @@ func GatherAssessmentMetadataFromOracle(
 	envVars := []string{fmt.Sprintf("ORACLE_PASSWORD=%s", source.Password),
 		fmt.Sprintf("TNS_ADMIN=%s", tnsAdmin),
 		fmt.Sprintf("ORACLE_HOME=%s", source.GetOracleHome()),
+		fmt.Sprintf("INCLUDE_LOB_SIZE_STATISTICS=%t", includeLobSizeStatistics),
 	}
 	log.Infof("environment variables passed to oracle gather metadata script: %v", envVars)
 	return runGatherAssessmentMetadataScript(scriptPath, envVars, assessmentMetadataDir,
