@@ -207,7 +207,7 @@ func init() {
 			"Example: \"host1:5432, host2:5433\". (only valid for PostgreSQL)")
 
 	BoolVar(assessMigrationCmd.Flags(), &includeLobSizeStatistics, "include-lob-size-statistics", false,
-		"Include minimum, maximum, and average size statistics for BLOB and CLOB columns in the assessment report. (default false)")
+		"Include minimum, maximum, and average size statistics for BLOB and CLOB columns in the assessment report. (Only valid for ORACLE)")
 
 	assessMigrationCmd.Flags().BoolVar(&primaryOnly, "primary-only", false,
 		"assess only the primary database, skip read replica discovery and assessment (only valid for PostgreSQL).")
@@ -1347,9 +1347,13 @@ func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []ut
 	var unsupportedDataTypes, unsupportedDataTypesForLiveMigration, unsupportedDataTypesForLiveMigrationWithFForFB []utils.TableColumnsDataTypes
 
 	var query string
-	if bool(includeLobSizeStatistics) {
+        if source.DBType != ORACLE {
+		query = fmt.Sprintf(`SELECT schema_name, table_name, column_name, data_type FROM %s WHERE source_node = 'primary'`,
+			migassessment.TABLE_COLUMNS_DATA_TYPES)
+	} else {
+	       if bool(includeLobSizeStatistics) {
 		// Join with LOB column sizes to get size statistics for BLOB/CLOB columns
-		query = fmt.Sprintf(`SELECT 
+		  query = fmt.Sprintf(`SELECT 
 			tcdt.schema_name, 
 			tcdt.table_name, 
 			tcdt.column_name, 
@@ -1358,19 +1362,20 @@ func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []ut
 			lcs.max_size_bytes,
 			lcs.avg_size_bytes,
 			lcs.non_null_count
-		FROM %s tcdt
-		LEFT JOIN %s lcs ON 
+		   FROM %s tcdt
+		   LEFT JOIN %s lcs ON 
 			tcdt.schema_name = lcs.schema_name AND 
 			tcdt.table_name = lcs.table_name AND 
 			tcdt.column_name = lcs.column_name AND
 			tcdt.source_node = lcs.source_node
-		WHERE tcdt.source_node = 'primary'`,
+		   WHERE tcdt.source_node = 'primary'`,
 			migassessment.TABLE_COLUMNS_DATA_TYPES,
 			migassessment.LOB_COLUMN_SIZES)
-	} else {
-		// Simple query without LOB size statistics
-		query = fmt.Sprintf(`SELECT schema_name, table_name, column_name, data_type FROM %s WHERE source_node = 'primary'`,
-			migassessment.TABLE_COLUMNS_DATA_TYPES)
+		} else {
+			// Simple query without LOB size statistics
+			query = fmt.Sprintf(`SELECT schema_name, table_name, column_name, data_type FROM %s WHERE source_node = 'primary'`,
+				migassessment.TABLE_COLUMNS_DATA_TYPES)
+		}
 	}
 
 	rows, err := assessmentDB.Query(query)
@@ -1462,7 +1467,7 @@ func fetchColumnsWithUnsupportedDataTypes() ([]utils.TableColumnsDataTypes, []ut
 		case isUnsupportedDatatypeInLiveWithFFOrFB:
 			/*
 				TODO test this for Oracle case if there is any special handling required
-				For Live mgiration with FF or FB, It is meant to be for the datatypes that are going to be in YB after migration
+				For Live migration with FF or FB, It is meant to be for the datatypes that are going to be in YB after migration
 				so it makes sense to use the analyzeSchema `compositeTypes` or `enumTypes` and check from there but some information
 				we are still using from Source which might need a better way in case of Oracle as for PG it doesn't really makes a difference in
 				source or analyzeSchema's results.
