@@ -16,12 +16,10 @@ limitations under the License.
 package cmd
 
 import (
-	"errors"
 	"fmt"
+	"sort"
 
 	goerrors "github.com/go-errors/errors"
-
-	"time"
 
 	"github.com/davecgh/go-spew/spew"
 	"github.com/mroth/weightedrand/v2"
@@ -41,7 +39,7 @@ type FileTaskPicker interface {
 	Pick() (*ImportFileTask, error)
 	MarkTaskAsDone(task *ImportFileTask) error
 	HasMoreTasks() bool
-	WaitForTasksBatchesTobeImported() error
+	InProgressTasks() []*ImportFileTask
 }
 
 /*
@@ -118,12 +116,11 @@ func (s *SequentialTaskPicker) HasMoreTasks() bool {
 	return len(s.pendingTasks) > 0
 }
 
-func (s *SequentialTaskPicker) WaitForTasksBatchesTobeImported() error {
-	// Consider the scenario where we have a single task in progress and all batches are submitted, but not yet ingested.
-	// In this case as per SequentialTaskPicker's implementation, it will wait for the task to be marked as done.
-	// Instead of having a busy-loop where we keep checking if the task is done, we can wait for a second and then check again.
-	time.Sleep(time.Second * 1)
-	return nil
+func (s *SequentialTaskPicker) InProgressTasks() []*ImportFileTask {
+	if s.inProgressTask == nil {
+		return []*ImportFileTask{}
+	}
+	return []*ImportFileTask{s.inProgressTask}
 }
 
 /*
@@ -391,30 +388,13 @@ func (c *ColocatedAwareRandomTaskPicker) HasMoreTasks() bool {
 	return pendingTasks
 }
 
-func (c *ColocatedAwareRandomTaskPicker) WaitForTasksBatchesTobeImported() error {
-	// if for all in-progress tasks, all batches are submitted, then sleep for a bit
-	allTasksAllBatchesSubmitted := true
-
-	for _, task := range c.inProgressTasks {
-		taskAllBatchesSubmitted, err := c.state.AllBatchesSubmittedForTask(task.ID)
-		if err != nil {
-			return fmt.Errorf("checking if all batches are submitted for task: %v: %w", task, err)
-		}
-		if !taskAllBatchesSubmitted {
-			allTasksAllBatchesSubmitted = false
-			break
-		}
-	}
-
-	if allTasksAllBatchesSubmitted {
-		log.Infof("All batches submitted for all in-progress tasks. Sleeping")
-		time.Sleep(time.Millisecond * 100)
-	}
-	return nil
+func (c *ColocatedAwareRandomTaskPicker) InProgressTasks() []*ImportFileTask {
+	return c.inProgressTasks
 }
 
 /*
-The goal of this picker is to pick a combination of colocated and sharded tasks, both at random.
+The goal of this picker is to pick a combination of colocated and sharded tasks.
+Colocated tasks are picked at random, while sharded tasks are picked in descending order of size (largest first).
 The limits in place are maxShardedTasksInProgress, maxColocatedTasksInProgress and colocatedBatchTaskQueue.
 
 Colocated tasks are limited by single tablet performance limits on YB, so we have to constrain the no. of colocated
@@ -437,8 +417,26 @@ type ColocatedCappedRandomTaskPicker struct {
 	inProgressColocatedTasks []*ImportFileTask
 
 	// tasks which have not yet been picked even once.
-	pendingShardedTasks   []*ImportFileTask
-	pendingColocatedTasks []*ImportFileTask
+	orderedPendingShardedTasks []*ImportFileTask // sorted by Size desc, see sortTasksBySizeDesc
+	pendingColocatedTasks      []*ImportFileTask
+}
+
+func sortTasksBySizeDesc(tasks []*ImportFileTask) []*ImportFileTask {
+	if len(tasks) <= 1 {
+		return tasks
+	}
+
+	// Sort by RowCount desc, then by FileSize desc as tiebreaker.
+	// In import-data, row counts are properly populated by export-data.
+	// In import-data-file, row counts are not known (all 0), so FileSize is used.
+	sort.Slice(tasks, func(i, j int) bool {
+		if tasks[i].RowCount != tasks[j].RowCount {
+			return tasks[i].RowCount > tasks[j].RowCount
+		}
+		return tasks[i].FileSize > tasks[j].FileSize
+	})
+	log.Infof("Sorted sharded tasks by RowCount/FileSize desc")
+	return tasks
 }
 
 func NewColocatedCappedRandomTaskPicker(maxShardedTasksInProgress int, maxColocatedTasksInProgress int, tasks []*ImportFileTask,
@@ -514,8 +512,8 @@ func NewColocatedCappedRandomTaskPicker(maxShardedTasksInProgress int, maxColoca
 		inProgressColocatedTasks: inProgressColocatedTasks,
 		inProgressShardedTasks:   inProgressShardedTasks,
 
-		pendingColocatedTasks: pendingColcatedTasks,
-		pendingShardedTasks:   pendingShardedTasks,
+		pendingColocatedTasks:      pendingColcatedTasks,
+		orderedPendingShardedTasks: sortTasksBySizeDesc(pendingShardedTasks),
 
 		tableTypes:              tableTypes,
 		colocatedBatchTaskQueue: colocatedBatchTaskQueue,
@@ -525,16 +523,16 @@ func NewColocatedCappedRandomTaskPicker(maxShardedTasksInProgress int, maxColoca
 	return picker, nil
 }
 
-func (c *ColocatedCappedRandomTaskPicker) inProgressTasks() []*ImportFileTask {
+func (c *ColocatedCappedRandomTaskPicker) InProgressTasks() []*ImportFileTask {
 	return append(c.inProgressColocatedTasks, c.inProgressShardedTasks...)
 }
 
 func (c *ColocatedCappedRandomTaskPicker) pendingTasks() []*ImportFileTask {
-	return append(c.pendingColocatedTasks, c.pendingShardedTasks...)
+	return append(c.pendingColocatedTasks, c.orderedPendingShardedTasks...)
 }
 
 func (c *ColocatedCappedRandomTaskPicker) HasMoreTasks() bool {
-	return len(c.inProgressTasks()) > 0 || len(c.pendingTasks()) > 0
+	return len(c.InProgressTasks()) > 0 || len(c.pendingTasks()) > 0
 }
 
 func (c *ColocatedCappedRandomTaskPicker) HasMoreColocatedTasks() bool {
@@ -542,7 +540,7 @@ func (c *ColocatedCappedRandomTaskPicker) HasMoreColocatedTasks() bool {
 }
 
 func (c *ColocatedCappedRandomTaskPicker) HasMoreShardedTasks() bool {
-	return len(c.inProgressShardedTasks) > 0 || len(c.pendingShardedTasks) > 0
+	return len(c.inProgressShardedTasks) > 0 || len(c.orderedPendingShardedTasks) > 0
 }
 
 func (c *ColocatedCappedRandomTaskPicker) pickRandomFromListOfTasks(tasks []*ImportFileTask) (int, *ImportFileTask) {
@@ -656,16 +654,16 @@ func (c *ColocatedCappedRandomTaskPicker) pickShardedTask() (*ImportFileTask, er
 
 func (c *ColocatedCappedRandomTaskPicker) pickPendingShardedTaskAsPerMaxTasks() (*ImportFileTask, error) {
 	if len(c.inProgressShardedTasks) < c.maxShardedTasksInProgress {
-		if len(c.pendingShardedTasks) > 0 {
-			taskIndex, pickedTask := c.pickRandomFromListOfTasks(c.pendingShardedTasks)
-			c.pendingShardedTasks = append(c.pendingShardedTasks[:taskIndex], c.pendingShardedTasks[taskIndex+1:]...)
+		if len(c.orderedPendingShardedTasks) > 0 {
+			pickedTask := c.orderedPendingShardedTasks[0]
+			c.orderedPendingShardedTasks = c.orderedPendingShardedTasks[1:]
 			c.inProgressShardedTasks = append(c.inProgressShardedTasks, pickedTask)
 			log.Debugf("picking pending sharded task: %v", pickedTask)
 			return pickedTask, nil
 		}
 	}
-	log.Debugf("could not pick pending sharded task. inProgressShardedTasks: %v, maxShardedTasksInProgress: %v, pendingShardedTasks: %v",
-		c.inProgressShardedTasks, c.maxShardedTasksInProgress, c.pendingShardedTasks)
+	log.Debugf("could not pick pending sharded task. inProgressShardedTasks: %v, maxShardedTasksInProgress: %v, orderedPendingShardedTasks: %v",
+		c.inProgressShardedTasks, c.maxShardedTasksInProgress, c.orderedPendingShardedTasks)
 	return nil, nil
 }
 
@@ -694,32 +692,6 @@ func (c *ColocatedCappedRandomTaskPicker) MarkTaskAsDone(task *ImportFileTask) e
 			return nil
 		}
 	}
-	return goerrors.Errorf("task [%v] not found in inProgressTasks: %v", task, c.inProgressTasks())
+	return goerrors.Errorf("task [%v] not found in inProgressTasks: %v", task, c.InProgressTasks())
 }
 
-func (c *ColocatedCappedRandomTaskPicker) WaitForTasksBatchesTobeImported() error {
-	// if for all in-progress tasks, all batches are submitted, then sleep for a bit
-	allTasksAllBatchesSubmitted := true
-
-	for _, task := range c.inProgressTasks() {
-		taskAllBatchesSubmitted, err := c.state.AllBatchesSubmittedForTask(task.ID)
-		if err != nil {
-			if errors.As(err, &ErrTaskNotFound{}) {
-				log.Infof("task [%v] not found in state. Assuming all batches NOT submitted for task", task)
-				allTasksAllBatchesSubmitted = false
-				break
-			}
-			return fmt.Errorf("checking if all batches are submitted for task: %v: %w", task, err)
-		}
-		if !taskAllBatchesSubmitted {
-			allTasksAllBatchesSubmitted = false
-			break
-		}
-	}
-
-	if allTasksAllBatchesSubmitted {
-		log.Infof("All batches submitted for all in-progress tasks. Sleeping")
-		time.Sleep(time.Millisecond * 100)
-	}
-	return nil
-}

@@ -120,7 +120,7 @@ func (pg *TargetPostgreSQL) Init() error {
 	if len(pg.tconf.SessionVars) == 0 {
 		pg.tconf.SessionVars = getPGSessionInitScript(pg.tconf)
 	}
-	schemas := strings.Split(pg.tconf.Schema, ",")
+	schemas := sqlname.ExtractIdentifiersUnquoted(pg.tconf.Schemas)
 	schemaList := strings.Join(schemas, "','") // a','b','c
 	checkSchemaExistsQuery := fmt.Sprintf(
 		"SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname IN ('%s');",
@@ -232,18 +232,27 @@ func (pg *TargetPostgreSQL) PrepareForStreaming() {
 	pg.connPool.DisableThrottling()
 }
 
-const PG_DEFAULT_PARALLELISM_FACTOR = 8 // factor for default parallelism in case fetchDefaultParallelJobs() is not able to get the no of cores
+const PG_DEFAULT_PARALLELISM = 8 // default parallel jobs when core detection fails
+
+func (pg *TargetPostgreSQL) fetchDefaultParallelJobs() int {
+	totalCores, err := fetchCores([]*TargetConf{pg.tconf})
+	if err != nil {
+		log.Warnf("error fetching cores, using default parallelism of %d: %v",
+			PG_DEFAULT_PARALLELISM, err)
+		return PG_DEFAULT_PARALLELISM
+	}
+	if totalCores == 0 { //if target is running on MacOS, we are unable to determine totalCores
+		return 3
+	}
+	return totalCores / 2
+}
 
 func (pg *TargetPostgreSQL) InitConnPool() error {
-	tconfs := []*TargetConf{pg.tconf}
-	var targetUriList []string
-	for _, tconf := range tconfs {
-		targetUriList = append(targetUriList, tconf.Uri)
-	}
+	targetUriList := []string{pg.tconf.Uri}
 	log.Infof("targetUriList: %s", utils.GetRedactedURLs(targetUriList))
 
 	if pg.tconf.Parallelism == 0 {
-		pg.tconf.Parallelism = fetchDefaultParallelJobs(tconfs, PG_DEFAULT_PARALLELISM_FACTOR)
+		pg.tconf.Parallelism = pg.fetchDefaultParallelJobs()
 		log.Infof("Using %d parallel jobs by default. Use --parallel-jobs to specify a custom value", pg.tconf.Parallelism)
 	}
 	params := &ConnectionParams{
@@ -254,7 +263,11 @@ func (pg *TargetPostgreSQL) InitConnPool() error {
 		// works fine as we check the support of any session variable before using it in the script.
 		// So upsert and disable transaction will never be used for PG
 	}
-	pg.connPool = NewConnectionPool(params)
+	var err error
+	pg.connPool, err = NewConnectionPool(params)
+	if err != nil {
+		return fmt.Errorf("creating connection pool: %w", err)
+	}
 	return nil
 }
 
@@ -561,20 +574,24 @@ func (pg *TargetPostgreSQL) ExecuteBatch(migrationUUID uuid.UUID, batch *EventBa
 	for i := 0; i < len(batch.Events); i++ {
 		event := batch.Events[i]
 		if event.Op == "u" {
-			stmt, err := event.GetSQLStmt(pg)
+			stmt, err := event.GetSQLStmt(pg, pg.tconf.UsePartitionRoot)
 			if err != nil {
 				return fmt.Errorf("get sql stmt: %w", err)
 			}
 			ybBatch.Queue(stmt)
 			log.Debugf("SQL statement: Batch(%s): Event(%d): [%s]", batch.ID(), event.Vsn, stmt)
 		} else {
-			stmt, err := event.GetPreparedSQLStmt(pg, pg.tconf.TargetDBType)
+			stmt, err := event.GetPreparedSQLStmt(pg, pg.tconf.TargetDBType, pg.tconf.UsePartitionRoot)
 			if err != nil {
 				return fmt.Errorf("get prepared sql stmt: %w", err)
 			}
 			params := event.GetParams()
 			if _, ok := stmtToPrepare[stmt]; !ok {
-				stmtToPrepare[event.GetPreparedStmtName()] = stmt
+				psName, err := event.GetPreparedStmtName(pg.tconf.UsePartitionRoot)
+				if err != nil {
+					return fmt.Errorf("get prepared stmt name: %w", err)
+				}
+				stmtToPrepare[psName] = stmt
 			}
 			ybBatch.Queue(stmt, params...)
 			log.Debugf("SQL statement: Batch(%s): Event(%d): PREPARED STMT:[%s] PARAMS:[%s]", batch.ID(), event.Vsn, stmt, event.GetParamsString())
@@ -702,7 +719,8 @@ func (pg *TargetPostgreSQL) ExecuteBatch(migrationUUID uuid.UUID, batch *EventBa
 }
 
 func (pg *TargetPostgreSQL) setTargetSchema(conn *pgx.Conn) {
-	setSchemaQuery := fmt.Sprintf("SET SEARCH_PATH TO %s", pg.tconf.Schema)
+	schemas := sqlname.JoinIdentifiersMinQuoted(pg.tconf.Schemas, ", ")
+	setSchemaQuery := fmt.Sprintf("SET SEARCH_PATH TO %s", schemas)
 	_, err := conn.Exec(context.Background(), setSchemaQuery)
 	if err != nil {
 		utils.ErrExit("run query: %q on target %q: %w", setSchemaQuery, pg.tconf.Host, err)
@@ -997,7 +1015,7 @@ func (pg *TargetPostgreSQL) isUserSuperUser() (bool, error) {
 
 func (pg *TargetPostgreSQL) listSchemasMissingUsagePermission() ([]string, error) {
 	// Users need usage permissions on the schemas they want to export and the pg_catalog and information_schema schemas
-	querySchemaArray := pg.getSchemaList()
+	querySchemaArray := sqlname.ExtractIdentifiersUnquoted(pg.tconf.Schemas)
 	querySchemaList := strings.Join(querySchemaArray, ",")
 	chkSchemaUsagePermissionQuery := fmt.Sprintf(`
 	SELECT 
@@ -1045,7 +1063,7 @@ func (pg *TargetPostgreSQL) listSchemasMissingUsagePermission() ([]string, error
 }
 
 func (pg *TargetPostgreSQL) listTablesMissingSelectInsertUpdateDeletePermissions() (map[string][]string, error) {
-	querySchemaArray := pg.getSchemaList()
+	querySchemaArray := sqlname.ExtractIdentifiersUnquoted(pg.tconf.Schemas)
 	querySchemaList := strings.Join(querySchemaArray, ",")
 
 	query := fmt.Sprintf(`
@@ -1140,17 +1158,12 @@ func (pg *TargetPostgreSQL) listTablesMissingSelectInsertUpdateDeletePermissions
 	return missingPermissions, nil
 }
 
-func (pg *TargetPostgreSQL) getSchemaList() []string {
-	schemas := strings.Split(pg.tconf.Schema, ",")
-	return schemas
-}
-
 func (pg *TargetPostgreSQL) GetEnabledTriggersAndFks() (enabledTriggers []string, enabledFks []string, err error) {
 	if slices.Contains(pg.tconf.SessionVars, SET_SESSION_REPLICATE_ROLE_TO_REPLICA) {
 		//Not check for any triggers / FKs in case this session parameter is used
 		return nil, nil, nil
 	}
-	querySchemaArray := pg.getSchemaList()
+	querySchemaArray := sqlname.ExtractIdentifiersUnquoted(pg.tconf.Schemas)
 	querySchemaList := strings.Join(querySchemaArray, ",")
 
 	// Check the trigger status using the tgenabled column, which can have three possible values:

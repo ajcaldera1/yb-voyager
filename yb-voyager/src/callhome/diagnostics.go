@@ -28,13 +28,13 @@ import (
 	"strings"
 	"time"
 
+	goerrors "github.com/go-errors/errors"
 	"github.com/google/uuid"
 	"github.com/jackc/pgconn"
 	pgconnv5 "github.com/jackc/pgx/v5/pgconn"
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
 
-	goerrors "github.com/go-errors/errors"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/anon"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/errs"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/query/queryissue"
@@ -86,14 +86,15 @@ type Payload struct {
 	Status           string    `json:"status"`
 }
 
-// SHOULD NOT REMOVE THESE (host, db_type, db_version, total_db_size_bytes) FIELDS of SourceDBDetails as parsing these specifically here
+// SHOULD NOT REMOVE THESE (host, db_type, db_version, total_db_size_bytes, db_id) FIELDS of SourceDBDetails as parsing these specifically here
 // https://github.com/yugabyte/yugabyte-growth/blob/ad5df306c50c05136df77cd6548a1091ae577046/diagnostics_v2/main.py#L549
 
 /*
 Version History
 1.0: Introduced DBName and SchemaNames fields
+1.1: Added db_id (PostgreSQL/YugabyteDB: pg_database.oid; Oracle: v$database.dbid; MySQL: 0)
 */
-var SOURCE_DB_DETAILS_PAYLOAD_VERSION = "1.0"
+var SOURCE_DB_DETAILS_PAYLOAD_VERSION = "1.1"
 
 type SourceDBDetails struct {
 	PayloadVersion     string   `json:"payload_version"`
@@ -103,6 +104,7 @@ type SourceDBDetails struct {
 	DBSize             int64    `json:"total_db_size_bytes"`            //bytes
 	Role               string   `json:"role,omitempty"`                 //for differentiating replica details
 	DBSystemIdentifier int64    `json:"db_system_identifier,omitempty"` //Database system identifier for unique instance identification (currently only implemented for PostgreSQL)
+	DBID               int64    `json:"db_id"`                          // postgresql/yugabytedb: pg_database.oid;
 	DBName             string   `json:"db_name,omitempty"`              //Anonymized database name
 	SchemaNames        []string `json:"schema_names,omitempty"`         //Anonymized schema names
 }
@@ -327,8 +329,10 @@ Version History:
 1.2: Split out the data metrics into a separate struct - ImportDataMetrics
 1.3: Added CurrentParallelConnections field to ImportDataMetrics
 1.4: Added CutoverTimings field
+1.5: Added table list count to ImportDataMetrics
+1.6: Added iterative cutover enabled and next iteration migration UUID fields
 */
-var IMPORT_DATA_CALLHOME_PAYLOAD_VERSION = "1.4"
+var IMPORT_DATA_CALLHOME_PAYLOAD_VERSION = "1.6"
 
 type ImportDataPhasePayload struct {
 	PayloadVersion              string            `json:"payload_version"`
@@ -342,12 +346,14 @@ type ImportDataPhasePayload struct {
 	YBClusterMetrics            YBClusterMetrics  `json:"yb_cluster_metrics"`
 	DataMetrics                 ImportDataMetrics `json:"data_metrics"`
 	//TODO: see if these three can be changed to not use omitempty to put the data for 0 rate or total events
-	Phase            string          `json:"phase,omitempty"`
-	LiveWorkflowType string          `json:"live_workflow_type,omitempty"`
-	EnableUpsert     bool            `json:"enable_upsert"`
-	Error            string          `json:"error"`
-	ControlPlaneType string          `json:"control_plane_type"`
-	CutoverTimings   *CutoverTimings `json:"cutover_timings,omitempty"`
+	Phase                      string          `json:"phase,omitempty"`
+	IterativeCutoverEnabled    bool            `json:"iterative_cutover_enabled"`
+	NextIterationMigrationUUID *uuid.UUID      `json:"next_iteration_migration_uuid,omitempty"`
+	LiveWorkflowType           string          `json:"live_workflow_type,omitempty"`
+	EnableUpsert               bool            `json:"enable_upsert"`
+	Error                      string          `json:"error"`
+	ControlPlaneType           string          `json:"control_plane_type"`
+	CutoverTimings             *CutoverTimings `json:"cutover_timings,omitempty"`
 }
 
 type ImportDataMetrics struct {
@@ -362,6 +368,9 @@ type ImportDataMetrics struct {
 	SnapshotTotalRows       int64 `json:"snapshot_total_rows"`
 	SnapshotTotalBytes      int64 `json:"snapshot_total_bytes"`
 	CdcEventsImportRate3min int64 `json:"cdc_events_import_rate_3min"`
+
+	// table list count - number of tables being imported
+	TableListCount int `json:"table_list_count"`
 }
 
 type YBClusterMetrics struct {
@@ -403,6 +412,9 @@ type ImportDataFileMetrics struct {
 	// command run related metrics; for the current command run.
 	SnapshotTotalRows  int64 `json:"snapshot_total_rows"`
 	SnapshotTotalBytes int64 `json:"snapshot_total_bytes"`
+
+	// table list count - number of tables being imported
+	TableListCount int `json:"table_list_count"`
 }
 
 type DataFileParameters struct {
@@ -460,6 +472,25 @@ type EndMigrationPhasePayload struct {
 	SaveMigrationReports bool   `json:"save_migration_reports"`
 	Error                string `json:"error"`
 	ControlPlaneType     string `json:"control_plane_type"`
+}
+
+// =============================== Archive Changes ===============================
+
+/*
+Version History
+1.0: Initial version
+*/
+var ARCHIVE_CHANGES_CALLHOME_PAYLOAD_VERSION = "1.0"
+
+type ArchiveChangesPhasePayload struct {
+	PayloadVersion             string `json:"payload_version"`
+	Policy                     string `json:"policy"`
+	FSUtilizationThreshold     int    `json:"fs_utilization_threshold"`
+	TotalSegments              int    `json:"total_segments"`
+	ArchivedAndDeletedSegments int    `json:"archived_and_deleted_segments"`
+	PendingSegments            int    `json:"pending_segments"`
+	Error                      string `json:"error"`
+	ControlPlaneType           string `json:"control_plane_type"`
 }
 
 func MarshalledJsonString[T any](value T) string {
@@ -571,15 +602,46 @@ func addSpecificNonSensitiveContextForError(err error, anonymizer *anon.VoyagerA
 	addPostgreSQLErrorContext(err, context)
 	addExecuteDDLErrorContext(err, anonymizer, context)
 	addStackTrace(err, context)
-
-	return
 }
 
 func addStackTrace(err error, context map[string]string) {
-	var goErr *goerrors.Error
-	if goerrors.As(err, &goErr) {
+	goErr := findInnermostGoError(err)
+	if goErr != nil {
 		context["stack_trace"] = string(goErr.Stack())
 	}
+}
+
+func findInnermostGoError(err error) *goerrors.Error {
+	if err == nil {
+		return nil
+	}
+
+	var deepest *goerrors.Error
+	deepestDepth := -1
+
+	var walk func(curr error, depth int)
+	walk = func(curr error, depth int) {
+		if curr == nil {
+			return
+		}
+
+		if goErr, ok := curr.(*goerrors.Error); ok && depth >= deepestDepth {
+			deepest = goErr
+			deepestDepth = depth
+		}
+
+		switch unwrapped := curr.(type) {
+		case interface{ Unwrap() []error }:
+			for _, child := range unwrapped.Unwrap() {
+				walk(child, depth+1)
+			}
+		case interface{ Unwrap() error }:
+			walk(unwrapped.Unwrap(), depth+1)
+		}
+	}
+
+	walk(err, 0)
+	return deepest
 }
 
 func addImportBatchErrorContext(err error, context map[string]string) {

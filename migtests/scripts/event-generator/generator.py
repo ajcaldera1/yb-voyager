@@ -1,13 +1,21 @@
 import random
 import itertools
 import psycopg2
+import threading
 from utils import generate_table_schemas
 from utils import (
     execute_with_retry,
     build_insert_values,
     build_update_values,
 )
-from utils import load_event_generator_config, get_connection_kwargs_from_config
+from utils import (
+    run_index_operations,
+    load_event_generator_config,
+    get_connection_kwargs_from_config,
+    detect_db_flavor,
+    get_estimated_row_count,
+    build_sampling_condition,
+)
 import time
 from utils import set_faker_seed
 import argparse
@@ -55,6 +63,13 @@ UPDATE_MAX_RETRIES = GEN["update_max_retries"]
 # Throttling
 WAIT_AFTER_OPERATIONS = GEN["wait_after_operations"]
 WAIT_DURATION_SECONDS = GEN["wait_duration_seconds"]
+
+# Index events flag
+ENABLE_INDEX_CREATE_DROP = GEN.get("enable_index_create_drop", False)
+INDEX_EVENTS_INTERVAL = GEN.get("index_events_interval", 5)
+
+# Column overrides for partition-aware value generation
+COLUMN_OVERRIDES = GEN.get("column_overrides", {})
 # ---------------------------------
 
 # Deterministic seeds from YAML
@@ -70,6 +85,13 @@ if FAKER_SEED is not None:
 # Connect to PostgreSQL using config
 conn = psycopg2.connect(**get_connection_kwargs_from_config(CONFIG))
 cursor = conn.cursor()
+
+# Refresh planner statistics up front for better row estimates
+cursor.execute("ANALYZE;")
+conn.commit()
+
+# Detect database flavor (PostgreSQL vs YugabyteDB)
+DB_FLAVOR = detect_db_flavor(cursor)
 
 cursor.execute("""
     CREATE EXTENSION IF NOT EXISTS tsm_system_rows;
@@ -93,10 +115,28 @@ table_schemas = generate_table_schemas(
 )
 print("Schema analysed")
 
+# Precompute estimated row counts once per table for sampling decisions
+ROW_ESTIMATES = {}
+for table in table_schemas.keys():
+    ROW_ESTIMATES[table] = get_estimated_row_count(cursor, SCHEMA_NAME, table)
+
 # Precompute table selection weights once: default weight 1 for unspecified tables
 RESOLVED_TABLE_WEIGHTS = dict(TABLE_WEIGHTS)
 for table in table_schemas.keys():
     RESOLVED_TABLE_WEIGHTS.setdefault(table, 1)
+
+# Start index operations thread if enabled
+stop_index_thread = None
+index_thread = None
+if ENABLE_INDEX_CREATE_DROP:
+    stop_index_thread = threading.Event()
+    index_thread = threading.Thread(
+        target=run_index_operations,
+        args=(stop_index_thread, CONFIG, SCHEMA_NAME, table_schemas, INDEX_EVENTS_INTERVAL),
+        daemon=True
+    )
+    index_thread.start()
+    print("Index events enabled - running concurrently with IUD operations")
 
 iteration_iter = itertools.count(1) if NUM_ITERATIONS == -1 else range(1, NUM_ITERATIONS + 1)
 
@@ -114,7 +154,7 @@ try:
             if operation == "INSERT":
                 # Generate random data and execute INSERT statement
                 columns = ", ".join(table_schemas[table_name]["columns"].keys())
-                values_holder = {"values_list": build_insert_values(table_schemas, table_name, INSERT_ROWS)}
+                values_holder = {"values_list": build_insert_values(table_schemas, table_name, INSERT_ROWS, COLUMN_OVERRIDES)}
 
                 # Prepare callbacks for retryable execution
                 def run_once():
@@ -122,7 +162,7 @@ try:
                     cursor.execute(query_to_run)
 
                 def rebuild():
-                    values_holder["values_list"] = build_insert_values(table_schemas, table_name, INSERT_ROWS)
+                    values_holder["values_list"] = build_insert_values(table_schemas, table_name, INSERT_ROWS, COLUMN_OVERRIDES)
 
                 success = execute_with_retry(run_once, rebuild, conn.rollback, max_retries=INSERT_MAX_RETRIES)
                 if success:
@@ -130,47 +170,62 @@ try:
                     pass
             
             elif operation == "UPDATE":
+                primary_key = table_schemas[table_name]["primary_key"]
+                if not primary_key:
+                    print(f"Skipping UPDATE on '{table_name}': no primary key found")
+                    continue
+
+                pk_set = set(primary_key) if isinstance(primary_key, list) else {primary_key}
+
                 for _ in range(UPDATE_MAX_RETRIES):
                     columns = table_schemas[table_name]["columns"]
-                    primary_key = table_schemas[table_name]["primary_key"]
 
-                    if len(columns) == 1:
-                        break  # Skip the entire update operation for tables with only one column
-                
-                    updateable_columns = [col for col in columns if col != primary_key]
+                    if len(columns) <= len(pk_set):
+                        break
+
+                    updateable_columns = [col for col in columns if col not in pk_set]
 
                     if not updateable_columns:
                         print(f"No updateable columns found for table {table_name}. Retrying...")
                         continue
 
                     num_columns_to_update = random.randint(1, len(updateable_columns))
-
-                    # Randomly choose the columns to update
                     columns_to_update = random.sample(updateable_columns, num_columns_to_update)
 
-                    set_clause, params = build_update_values(table_schemas, table_name, columns_to_update)
-                    where_clause = f"{primary_key} IN (SELECT {primary_key} FROM {table_name} TABLESAMPLE SYSTEM_ROWS(%s))"
-                    # Alternatives considered for choosing rows to UPDATE:
-                    # - ORDER BY RANDOM() LIMIT %s
-                    # - TABLESAMPLE SYSTEM (percentage-based sampling)
+                    set_clause, params = build_update_values(table_schemas, table_name, columns_to_update, COLUMN_OVERRIDES)
+                    where_clause, sampling_params = build_sampling_condition(
+                        db_flavor=DB_FLAVOR,
+                        table_name=table_name,
+                        primary_key=primary_key,
+                        target_row_count=UPDATE_ROWS,
+                        estimated_row_count=ROW_ESTIMATES.get(table_name),
+                    )
                     query_to_run = f"UPDATE {table_name} SET {set_clause} WHERE {where_clause}"
-                    params = params + [UPDATE_ROWS]
+                    full_params = params + sampling_params
 
                     try:
-                        cursor.execute(query_to_run, params)
+                        cursor.execute(query_to_run, full_params)
                         conn.commit()
-                        break  # Break out of the loop if the update is successful
+                        break
                     except Exception as e:
+                        print(f"UPDATE failed on '{table_name}': {e}")
                         conn.rollback()
 
             elif operation == "DELETE":
                 primary_key = table_schemas[table_name]["primary_key"]
-                query_to_run = f"DELETE FROM {table_name} WHERE {primary_key} IN (SELECT {primary_key} FROM {table_name} TABLESAMPLE SYSTEM_ROWS(%s))"
-                # Alternatives considered for choosing rows to DELETE:
-                # - ORDER BY RANDOM() LIMIT %s
-                # - simple LIMIT %s without TABLESAMPLE
-                params = (DELETE_ROWS,)
-                cursor.execute(query_to_run, params)
+                if not primary_key:
+                    print(f"Skipping DELETE on '{table_name}': no primary key found")
+                    continue
+
+                where_clause, sampling_params = build_sampling_condition(
+                    db_flavor=DB_FLAVOR,
+                    table_name=table_name,
+                    primary_key=primary_key,
+                    target_row_count=DELETE_ROWS,
+                    estimated_row_count=ROW_ESTIMATES.get(table_name),
+                )
+                query_to_run = f"DELETE FROM {table_name} WHERE {where_clause}"
+                cursor.execute(query_to_run, sampling_params)
 
                 conn.commit()
 
@@ -194,6 +249,12 @@ try:
 except KeyboardInterrupt:
     print("Received KeyboardInterrupt. Stopping generator...")
 finally:
+    # Stop index operations thread if it's running
+    if ENABLE_INDEX_CREATE_DROP and stop_index_thread is not None and index_thread is not None:
+        print("Stopping index operations thread...")
+        stop_index_thread.set()
+        index_thread.join(timeout=5)
+    
     # Commit changes outside the loop for UPDATE and DELETE operations
     try:
         conn.commit()

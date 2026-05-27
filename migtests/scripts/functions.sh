@@ -71,7 +71,8 @@ grant_user_permission_postgresql() {
 	db_name=$1
 	db_schema=$2
 	conn_string="postgresql://${SOURCE_DB_ADMIN_USER}:${SOURCE_DB_ADMIN_PASSWORD}@${SOURCE_DB_HOST}:${SOURCE_DB_PORT}/${db_name}"
-	echo "2" | psql "${conn_string}" -v voyager_user="${SOURCE_DB_USER}" \
+	echo "2" | psql "${conn_string}" --set ON_ERROR_STOP=on \
+                                    -v voyager_user="${SOURCE_DB_USER}" \
                                     -v schema_list="${db_schema}" \
                                     -v is_live_migration=0 \
                                     -f /opt/yb-voyager/guardrails-scripts/yb-voyager-pg-grant-migration-permissions.sql
@@ -90,6 +91,19 @@ run_ysql() {
 	db_name=$1
 	sql=$2
 	PGPASSWORD="${TARGET_DB_ADMIN_PASSWORD}" psql -P pager=off -h ${TARGET_DB_HOST} -p ${TARGET_DB_PORT} -U ${TARGET_DB_ADMIN_USER} -d ${db_name} -c "${sql}"
+}
+
+# TODO: Remove this helper (and all its call-sites) once the underlying
+# Voyager bug is fixed: https://yugabyte.atlassian.net/browse/DB-14314
+# target-side disconnect() does not close the sql.DB handle, leaving
+# stale sessions that block DROP DATABASE.
+# Once that is fixed, a plain `DROP DATABASE IF EXISTS "<name>";` should
+# suffice and this workaround can be removed.
+ysql_terminate_and_drop_database() {
+	local target_db_to_drop=$1
+	run_ysql yugabyte "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${target_db_to_drop}' AND pid != pg_backend_pid();" || true
+	sleep 1
+	run_ysql yugabyte "DROP DATABASE IF EXISTS \"${target_db_to_drop}\";"
 }
 
 ysql_import_file() {
@@ -183,7 +197,8 @@ grant_permissions_for_live_migration_pg() {
 	db_name=$1
 	db_schema=$2
 	conn_string="postgresql://${SOURCE_DB_ADMIN_USER}:${SOURCE_DB_ADMIN_PASSWORD}@${SOURCE_DB_HOST}:${SOURCE_DB_PORT}/${db_name}"
-	echo "2" | psql "${conn_string}" -v voyager_user="${SOURCE_DB_USER}" \
+	echo "2" | psql "${conn_string}" --set ON_ERROR_STOP=on \
+                                    -v voyager_user="${SOURCE_DB_USER}" \
                                     -v schema_list="${db_schema}" \
                                     -v replication_group='replication_group' \
                                     -v is_live_migration=1 \
@@ -552,9 +567,9 @@ archive_changes() {
 
     ARCHIVE_DIR=${EXPORT_DIR}/archive-dir
     mkdir ${ARCHIVE_DIR}
-    yb-voyager archive changes --move-to ${ARCHIVE_DIR} \
+    yb-voyager archive changes --policy archive --archive-dir ${ARCHIVE_DIR} \
         --export-dir ${EXPORT_DIR} \
-        --fs-utilization-threshold 0
+        --send-diagnostics=false
 }
 
 end_migration() {
@@ -576,7 +591,7 @@ end_migration() {
     yb-voyager end migration --export-dir ${EXPORT_DIR} \
         --backup-dir ${BACKUP_DIR} --backup-schema-files true \
         --backup-data-files true --backup-log-files true \
-        --save-migration-reports true "$@" || {
+        --save-migration-reports true --send-diagnostics=false "$@" || {
             cat ${EXPORT_DIR}/logs/yb-voyager-end-migration.log
             exit 1
         }
@@ -905,7 +920,8 @@ get_value_from_msr(){
 }
 
 set_replica_identity(){
-	db_schema=$1
+    #trim the quotes from the schema name
+    db_schema=$(echo $1 | sed 's/"//g')
     cat > alter_replica_identity.sql <<EOF
     DO \$CUSTOM\$ 
     DECLARE
@@ -913,7 +929,7 @@ set_replica_identity(){
     BEGIN
         FOR r IN (SELECT table_schema,table_name FROM information_schema.tables WHERE table_schema = '${db_schema}' AND table_type = 'BASE TABLE') 
         LOOP
-            EXECUTE 'ALTER TABLE ' || r.table_schema || '."' || r.table_name || '" REPLICA IDENTITY FULL';
+            EXECUTE 'ALTER TABLE ' || '"' || r.table_schema || '"."' || r.table_name || '" REPLICA IDENTITY FULL';
         END LOOP;
     END \$CUSTOM\$;
 EOF
@@ -927,7 +943,6 @@ grant_permissions_for_live_migration() {
     elif [ "${SOURCE_DB_TYPE}" = "postgresql" ]; then
 		for schema_name in $(echo ${SOURCE_DB_SCHEMA} | tr "," "\n")
 		do
-			set_replica_identity ${schema_name}
 			grant_permissions ${SOURCE_DB_NAME} ${SOURCE_DB_TYPE} ${schema_name}
 			grant_permissions_for_live_migration_pg ${SOURCE_DB_NAME} ${schema_name}
 		done
@@ -956,7 +971,8 @@ setup_fallback_environment() {
 		rm -f $TEMP_SCRIPT
 	    elif [ "${SOURCE_DB_TYPE}" = "postgresql" ]; then
 		conn_string="postgresql://${SOURCE_DB_ADMIN_USER}:${SOURCE_DB_ADMIN_PASSWORD}@${SOURCE_DB_HOST}:${SOURCE_DB_PORT}/${SOURCE_DB_NAME}"
-		echo "2" | psql "${conn_string}" -v voyager_user="${SOURCE_DB_USER}" \
+		echo "2" | psql "${conn_string}" --set ON_ERROR_STOP=on \
+                                    -v voyager_user="${SOURCE_DB_USER}" \
                                     -v schema_list="${SOURCE_DB_SCHEMA}" \
                                     -v replication_group='replication_group' \
                                     -v is_live_migration=1 \
@@ -1163,8 +1179,12 @@ move_tables() {
 normalize_json() {
     local input_file="$1"
     local output_file="$2"
-    local temp_file="/tmp/temp_file.json"
-	local temp_file2="/tmp/temp_file2.json"
+    # Use mktemp: hardcoded /tmp paths race across parallel nightly tests,
+    # causing jq-open errors and cross-test payload contamination in diffs.
+    local temp_file
+    temp_file=$(mktemp)
+    local temp_file2
+    temp_file2=$(mktemp)
 
     # Normalize JSON with jq; use --sort-keys to avoid the need to keep the same sequence of keys in expected vs actual json
     jq --sort-keys 'walk(
@@ -1217,6 +1237,7 @@ normalize_json() {
 
     # Move cleaned file to output
     mv "$temp_file2" "$output_file"
+    rm -f "$temp_file"
 }
 
 
@@ -1404,8 +1425,8 @@ create_source_db() {
 	source_db=$1
 	case ${SOURCE_DB_TYPE} in
 		postgresql)
-			run_psql postgres "DROP DATABASE IF EXISTS ${source_db};"
-			run_psql postgres "CREATE DATABASE ${source_db};"
+			run_psql postgres "DROP DATABASE IF EXISTS \"${source_db}\";"
+			run_psql postgres "CREATE DATABASE \"${source_db}\";"
 			;;
 		mysql)
 			run_mysql mysql "DROP DATABASE IF EXISTS ${source_db};"
@@ -1472,7 +1493,10 @@ generate_voyager_config() {
 normalize_callhome_json() {
     local input_file="$1"
     local output_file="$2"
-    local temp_file="/tmp/temp_file.json"
+    # Use mktemp: hardcoded /tmp paths race across parallel nightly tests,
+    # causing jq-open errors and cross-test payload contamination in diffs.
+    local temp_file
+    temp_file=$(mktemp)
 
     # Normalize JSON with jq; use --sort-keys to avoid the need to keep the same sequence of keys in expected vs actual json
     jq --sort-keys 'walk(
@@ -1492,7 +1516,17 @@ normalize_callhome_json() {
             .yb_cluster_metrics = "IGNORED" |
             .parallel_jobs = "IGNORED" |
             .adaptive_parallelism_max = "IGNORED" |
-            .snapshot_total_bytes = "IGNORED"
+            .snapshot_total_bytes = "IGNORED" |
+            .collected_at = "IGNORED" |
+            .phase_start_time = "IGNORED" |
+            .time_taken_sec = "IGNORED" |
+            .yb_voyager_version = "IGNORED" |
+            .migration_uuid = "IGNORED" |
+            .db_version = "IGNORED" |
+            .db_system_identifier = "IGNORED" |
+            .db_id = "IGNORED" |
+            .target_db_details = "IGNORED" |
+            .total_db_size_bytes = "IGNORED"
         elif type == "array" then
 			sort_by(tostring)
         elif type == "string" and (

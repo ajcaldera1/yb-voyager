@@ -19,7 +19,6 @@ import (
 	"fmt"
 
 	goerrors "github.com/go-errors/errors"
-
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -48,8 +47,10 @@ var exportDataFromTargetCmd = &cobra.Command{
 		}
 		if msr.FallbackEnabled {
 			exporterRole = TARGET_DB_EXPORTER_FB_ROLE
-		} else {
+		} else if msr.FallForwardEnabled {
 			exporterRole = TARGET_DB_EXPORTER_FF_ROLE
+		} else {
+			utils.ErrExit("no fall-forward/back enabled. Exiting...")
 		}
 		err = verifySSLFlags(cmd, msr)
 		if err != nil {
@@ -127,10 +128,13 @@ func initSourceConfFromTargetConf(cmd *cobra.Command) error {
 	source.Port = targetConf.Port
 	source.User = targetConf.User
 	source.DBName = targetConf.DBName
+
 	if sourceDBConf.DBType == POSTGRESQL {
-		source.Schema = sourceDBConf.Schema // in case of PG migration the tconf.Schema is public but in case of non-puclic or multiple schemas this needs to PG schemas
+		source.SchemaConfig = sourceDBConf.SchemaConfig
+		source.Schemas = sourceDBConf.Schemas // in case of PG migration the tconf.Schema is public but in case of non-puclic or multiple schemas this needs to PG schemas
 	} else {
-		source.Schema = targetConf.Schema
+		source.SchemaConfig = targetConf.SchemaConfig
+		source.Schemas = targetConf.Schemas
 	}
 
 	if msr.UseYBgRPCConnector {
@@ -169,7 +173,7 @@ func packAndSendExportDataFromTargetPayload(status string, errorMsg error) {
 	if !shouldSendCallhome() {
 		return
 	}
-	payload := createCallhomePayload()
+	payload := createCallhomePayload(migrationUUID)
 	payload.MigrationType = LIVE_MIGRATION
 
 	targetDBDetails := callhome.TargetDBDetails{

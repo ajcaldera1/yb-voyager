@@ -12,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
 )
 
@@ -19,6 +20,10 @@ type MysqlContainer struct {
 	mutex sync.Mutex
 	ContainerConfig
 	container testcontainers.Container
+}
+
+func (ms *MysqlContainer) SetConfig(config ContainerConfig) {
+	ms.ContainerConfig = config
 }
 
 func (ms *MysqlContainer) Start(ctx context.Context) (err error) {
@@ -172,6 +177,11 @@ func (ms *MysqlContainer) GetConnection() (*sql.DB, error) {
 	return db, nil
 }
 
+func (ms *MysqlContainer) GetConnectionWithDB(dbName string) (*sql.DB, error) {
+	// Fallback to default connection when dbName not used
+	return ms.GetConnection()
+}
+
 func (ms *MysqlContainer) GetVersion() (string, error) {
 	if ms == nil {
 		return "", fmt.Errorf("mysql container is not started: nil")
@@ -223,4 +233,14 @@ func (ms *MysqlContainer) Query(sql string, args ...interface{}) (*sql.Rows, err
 	}
 
 	return rows, nil
+}
+
+func (ms *MysqlContainer) QueryOnDB(dbName string, sql string, args ...interface{}) (*sql.Rows, error) {
+	//Not implemented
+	return ms.Query(sql, args...)
+}
+
+func (ms *MysqlContainer) ExecuteSqlsOnDB(dbName string, sqls ...string) {
+	//Not implemented
+	ms.ExecuteSqls(sqls...)
 }

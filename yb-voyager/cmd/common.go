@@ -32,10 +32,9 @@ import (
 	"time"
 	"unicode"
 
-	goerrors "github.com/go-errors/errors"
-
 	"github.com/davecgh/go-spew/spew"
 	"github.com/fatih/color"
+	goerrors "github.com/go-errors/errors"
 	_ "github.com/godror/godror"
 	"github.com/google/uuid"
 	"github.com/gosuri/uitable"
@@ -273,7 +272,7 @@ func getQuotedFromUnquoted(t string) string {
 	//To preserve case sensitiveness in the Unquoted
 	parts := strings.Split(t, ".")
 	s, t := parts[0], parts[1]
-	return fmt.Sprintf(`%s."%s"`, s, t)
+	return fmt.Sprintf(`"%s"."%s"`, s, t)
 }
 
 func displayExportedRowCountSnapshot(snapshotViaDebezium bool) {
@@ -287,7 +286,7 @@ func displayExportedRowCountSnapshot(snapshotViaDebezium bool) {
 	leafPartitions := getLeafPartitionsFromRootTable()
 	if !snapshotViaDebezium {
 		exportedRowCount := getExportedRowCountSnapshot(exportDir)
-		if source.Schema != "" {
+		if len(source.Schemas) > 0 {
 			addHeader(uitable, "SCHEMA", "TABLE", "ROW COUNT")
 		} else {
 			addHeader(uitable, "DATABASE", "TABLE", "ROW COUNT")
@@ -309,7 +308,7 @@ func displayExportedRowCountSnapshot(snapshotViaDebezium bool) {
 				partitions := strings.Join(partitions, ", ")
 				displayTableName = fmt.Sprintf("%s (%s)", table.CurrentName.Unqualified.MinQuoted, partitions)
 			}
-			schema := table.SourceName.SchemaName
+			schema := table.SourceName.SchemaName.MinQuoted
 			uitable.AddRow(schema, displayTableName, exportedRowCount[key])
 		}
 		if len(keys) > 0 {
@@ -342,7 +341,7 @@ func displayExportedRowCountSnapshot(snapshotViaDebezium bool) {
 			partitions := strings.Join(partitions, ", ")
 			displayTableName = fmt.Sprintf("%s (%s)", table.CurrentName.Unqualified.MinQuoted, partitions)
 		}
-		schema := table.CurrentName.SchemaName
+		schema := table.CurrentName.SchemaName.MinQuoted
 		uitable.AddRow(schema, displayTableName, tableStatus.ExportedRowCountSnapshot)
 
 	}
@@ -453,7 +452,7 @@ func displayImportedRowCountSnapshot(state *ImportDataState, tasks []*ImportFile
 }
 
 // setup a project having subdirs for various database objects IF NOT EXISTS
-func CreateMigrationProjectIfNotExists(dbType string, exportDir string) {
+func CreateMigrationProjectIfNotExists(dbType string, exportDir string) *metadb.MetaDB {
 	// TODO: add a check/prompt if any directories apart from required ones are present in export-dir
 	var projectSubdirs = []string{
 		"schema", "data", "reports",
@@ -489,7 +488,7 @@ func CreateMigrationProjectIfNotExists(dbType string, exportDir string) {
 		}
 	}
 
-	metaDB = initMetaDB(exportDir)
+	return initMetaDB(exportDir)
 }
 
 func initMetaDB(migrationExportDir string) *metadb.MetaDB {
@@ -501,7 +500,7 @@ func initMetaDB(migrationExportDir string) *metadb.MetaDB {
 	if err != nil {
 		utils.ErrExit("failed to initialize meta db: %s", err)
 	}
-	err = metaDBInstance.InitMigrationStatusRecord()
+	err = metaDBInstance.InitMigrationStatusRecord(cfgFile)
 	if err != nil {
 		utils.ErrExit("could not init migration status record: %w", err)
 	}
@@ -674,20 +673,20 @@ func InitNameRegistry(
 
 	var sdbReg namereg.SourceDBInterface
 	var ybdb namereg.YBDBInterface
-	var sourceDbType, sourceDbSchema, sourceDbName string
-	var targetDBSchema string
+	var sourceDbType, sourceDbName string
+	var targetDBSchema, sourceDbSchema []string
 
 	if sconf != nil {
 		sourceDbType = sconf.DBType
 		sourceDbName = sconf.DBName
-		sourceDbSchema = sconf.Schema
+		sourceDbSchema = sqlname.ExtractIdentifiersUnquoted(sconf.Schemas)
 	}
 	if sdb != nil {
 		sdbReg = sdb.(namereg.SourceDBInterface)
 	}
 
 	if tconf != nil {
-		targetDBSchema = tconf.Schema
+		targetDBSchema = sqlname.ExtractIdentifiersUnquoted(tconf.Schemas)
 	}
 	var ok bool
 	if tdb != nil && lo.Contains([]string{TARGET_DB_IMPORTER_ROLE, IMPORT_FILE_ROLE}, role) {
@@ -696,6 +695,7 @@ func InitNameRegistry(
 			return goerrors.Errorf("expected targetDB to adhere to YBDBRegirsty")
 		}
 	}
+
 	nameregistryParams := namereg.NameRegistryParams{
 		FilePath:       fmt.Sprintf("%s/metainfo/name_registry.json", exportDir),
 		Role:           role,
@@ -739,7 +739,11 @@ func retrieveMigrationUUID() error {
 	}
 
 	migrationUUID = uuid.MustParse(msr.MigrationUUID)
-	utils.PrintAndLogf("migrationID: %s", migrationUUID)
+	if !suppressInfoMessages {
+		utils.PrintAndLogfInfo("migrationID: %s", utils.Path.Sprint(migrationUUID))
+	} else {
+		log.Infof("migrationID: %s", migrationUUID)
+	}
 	return nil
 }
 
@@ -752,7 +756,7 @@ func nameContainsCapitalLetter(name string) bool {
 	return false
 }
 
-func getCutoverStatus() string {
+func GetCutoverStatus(metaDB *metadb.MetaDB) string {
 	msr, err := metaDB.GetMigrationStatusRecord()
 	if err != nil {
 		utils.ErrExit("get migration status record: %v", err)
@@ -767,7 +771,7 @@ func getCutoverStatus() string {
 	}
 	if msr.FallForwardEnabled && a && b && c && msr.ExportFromTargetFallForwardStarted {
 		return COMPLETED
-	} else if msr.FallbackEnabled && a && b && c && msr.ExportFromTargetFallBackStarted {
+	} else if msr.FallbackEnabled && a && b && c && msr.ExportFromTargetFallBackStarted && msr.ImportDataToSourceStarted {
 		return COMPLETED
 	} else if !msr.FallForwardEnabled && !msr.FallbackEnabled && a && b && c {
 		return COMPLETED
@@ -781,11 +785,11 @@ func checkStreamingMode() (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("error while fetching migration status record: %w", err)
 	}
-	streamChanges := changeStreamingIsEnabled(migrationStatus.ExportType)
+	streamChanges := changeStreamingIsEnabled(migrationStatus.ExportTypeFromSource)
 	return streamChanges, nil
 }
 
-func getCutoverToSourceReplicaStatus() string {
+func getCutoverToSourceReplicaStatus(metaDB *metadb.MetaDB) string {
 	msr, err := metaDB.GetMigrationStatusRecord()
 	if err != nil {
 		utils.ErrExit("get migration status record: %v", err)
@@ -802,7 +806,7 @@ func getCutoverToSourceReplicaStatus() string {
 	return INITIATED
 }
 
-func getCutoverToSourceStatus() string {
+func GetCutoverToSourceStatus(exportDir string, metaDB *metadb.MetaDB) string {
 	msr, err := metaDB.GetMigrationStatusRecord()
 	if err != nil {
 		utils.ErrExit("get migration status record: %v", err)
@@ -813,10 +817,38 @@ func getCutoverToSourceStatus() string {
 
 	if !a {
 		return NOT_INITIATED
-	} else if a && b && c {
+	} else if a && b && c && isNextIterationStartedIfRequied(exportDir, metaDB) {
 		return COMPLETED
 	}
 	return INITIATED
+}
+
+func isNextIterationStartedIfRequied(exportDir string, metaDB *metadb.MetaDB) bool {
+	msr, err := metaDB.GetMigrationStatusRecord()
+	if err != nil {
+		utils.ErrExit("get migration status record: %v", err)
+	}
+	if !msr.RestartDataMigrationSourceTargetNextIteration {
+		return true
+	}
+	if !msr.NextIterationInitialized {
+		return false
+	}
+
+	iterationsDir := msr.GetIterationsDir(exportDir)
+	nextIterationExportDir := GetIterationExportDir(iterationsDir, msr.IterationNo+1)
+	nextIterationMetaDB, err := metadb.NewMetaDB(nextIterationExportDir)
+	if err != nil {
+		utils.ErrExit("failed to create iteration meta db: %w", err)
+	}
+	nextIterationMsr, err := nextIterationMetaDB.GetMigrationStatusRecord()
+	if err != nil {
+		utils.ErrExit("get migration status record: %v", err)
+	}
+	if nextIterationMsr.ExportDataFromSourceStarted && nextIterationMsr.ImportDataToTargetStarted {
+		return true
+	}
+	return false
 }
 
 func getPassword(cmd *cobra.Command, cliArgName, envVarName string) (string, error) {
@@ -864,14 +896,15 @@ func validateMetaDBCreated() {
 	}
 }
 
-func getImportTableList(sourceTableList []string) ([]sqlname.NameTuple, error) {
+// TODO: rename
+func getInitialImportTableListForLive(sourceTableList []string) ([]sqlname.NameTuple, error) {
 	if importerRole == IMPORT_FILE_ROLE {
 		return nil, nil
 	}
 	var tableList []sqlname.NameTuple
 	sqlname.SourceDBType = source.DBType
 	for _, qualifiedTableName := range sourceTableList {
-		table, err := namereg.NameReg.LookupTableName(qualifiedTableName)
+		table, err := namereg.NameReg.LookupTableNameAndIgnoreIfTargetNotFoundBasedOnRole(qualifiedTableName)
 		if err != nil {
 			return nil, goerrors.Errorf("lookup table %s in name registry : %v", qualifiedTableName, err)
 		}
@@ -901,13 +934,12 @@ func hideExportFlagsInFallForwardOrBackCmds(cmd *cobra.Command) {
 	}
 }
 
-func GetDefaultPGSchema(schema string, separator string) (string, bool) {
+func GetDefaultPGSchema(schema []sqlname.Identifier) (string, bool) {
 	// second return value is true if public is not included in the schema
 	// which indicates that the no default schema
-	schemas := strings.Split(schema, separator)
-	if len(schemas) == 1 {
-		return schema, false
-	} else if slices.Contains(schemas, "public") {
+	if len(schema) == 1 {
+		return schema[0].MinQuoted, false
+	} else if lo.ContainsBy(schema, func(s sqlname.Identifier) bool { return s.MinQuoted == "public" }) {
 		return "public", false
 	} else {
 		return "", true
@@ -987,7 +1019,7 @@ func initBaseSourceEvent(bev *cp.BaseEvent, eventType string) {
 		MigrationUUID: migrationUUID,
 		DBType:        source.DBType,
 		DatabaseName:  source.DBName,
-		SchemaNames:   cp.GetSchemaList(source.Schema),
+		SchemaNames:   cp.GetSchemaList(sqlname.JoinIdentifiersUnquoted(source.Schemas, "|")),
 		DBIP:          utils.LookupIP(source.Host),
 		Port:          source.Port,
 		DBVersion:     source.DBVersion,
@@ -1000,7 +1032,7 @@ func initBaseTargetEvent(bev *cp.BaseEvent, eventType string) {
 		MigrationUUID: migrationUUID,
 		DBType:        tconf.TargetDBType,
 		DatabaseName:  tconf.DBName,
-		SchemaNames:   []string{tconf.Schema},
+		SchemaNames:   sqlname.ExtractIdentifiersUnquoted(tconf.Schemas),
 		DBIP:          utils.LookupIP(tconf.Host),
 		Port:          tconf.Port,
 		DBVersion:     tconf.DBVersion,
@@ -1021,7 +1053,7 @@ func renameTableIfRequired(table string) (string, bool) {
 
 	sourceDBType = msr.SourceDBConf.DBType
 	sourceDBTypeInMigration := msr.SourceDBConf.DBType
-	schema := msr.SourceDBConf.Schema
+	schema := msr.SourceDBConf.Schemas
 	sqlname.SourceDBType = source.DBType
 	if source.DBType != POSTGRESQL && source.DBType != YUGABYTEDB {
 		return table, false
@@ -1031,13 +1063,13 @@ func renameTableIfRequired(table string) (string, bool) {
 		return table, false
 	}
 	if sourceDBTypeInMigration != POSTGRESQL && source.DBType == YUGABYTEDB {
-		schema = source.Schema
+		schema = source.Schemas
 	}
 	renameTablesMap := msr.SourceRenameTablesMap
 	if source.DBType == YUGABYTEDB {
 		renameTablesMap = msr.TargetRenameTablesMap
 	}
-	defaultSchema, noDefaultSchema := GetDefaultPGSchema(schema, "|")
+	defaultSchema, noDefaultSchema := GetDefaultPGSchema(schema)
 	if noDefaultSchema && len(strings.Split(table, ".")) <= 1 {
 		utils.ErrExit("no default schema found to qualify table: %s", table)
 	}
@@ -1312,34 +1344,33 @@ func (ni NoteInfo) MarshalJSON() ([]byte, error) {
 		Text string   `json:"Text"`
 	}{
 		Type: ni.Type,
-		Text: stripHTMLTags(ni.Text),
+		Text: stripAnchorTags(ni.Text),
 	})
 }
 
-// stripHTMLTags removes <a> tags but preserves both link text and URL
-func stripHTMLTags(htmlText string) string {
+// stripAnchorTags converts HTML <a> tags to plain text "text (URL)" format,
+// preserving both the link text and the URL. If the link text equals the URL,
+// only the URL is kept to avoid duplication.
+// Note: This only handles <a> tags. Other HTML tags (e.g., <br>, <div>) are left as-is.
+func stripAnchorTags(htmlText string) string {
 	if htmlText == "" {
 		return ""
 	}
 
-	// Extract href and text from <a> tags: <a href="URL">text</a> → "text (URL)"
 	linkPattern := regexp.MustCompile(`<a[^>]*href=["']([^"']*)["'][^>]*>(.*?)</a>`)
 	result := linkPattern.ReplaceAllStringFunc(htmlText, func(match string) string {
 		submatch := linkPattern.FindStringSubmatch(match)
 		if len(submatch) >= 3 {
 			url := submatch[1]
 			text := submatch[2]
-			// If text is the same as URL, just return the URL
 			if text == url {
 				return url
 			}
-			// Otherwise return "text (URL)"
-			return text + " (" + url + ")"
+			return text + " ( " + url + " )"
 		}
 		return match
 	})
 
-	// Clean up whitespace
 	result = strings.TrimSpace(result)
 
 	return result
@@ -1386,14 +1417,16 @@ Version History
   - Added separate fields for notes: GeneralNotes, ColocatedShardedNotes, SizingNotes; deprecated Notes field
 
 1.7: Added ObjectUsage field to AssessmentIssueYugabyteD struct
+1.8: Added ParsedSchemaSummary field with structured Objects []ObjectPayload (ObjectName, ParentTableName, SchemaName) with unquoted names.
 */
-var ASSESS_MIGRATION_YBD_PAYLOAD_VERSION = "1.7"
+var ASSESS_MIGRATION_YBD_PAYLOAD_VERSION = "1.8"
 
 /*
 Version History
 1.0: Introduced AssessMigrationPayloadYBM struct for YBM-specific payload
+1.1: Added ParsedSchemaSummary field with structured Objects []ObjectPayload (ObjectName, ParentTableName, SchemaName) with unquoted names.
 */
-var ASSESS_MIGRATION_YBM_PAYLOAD_VERSION = "1.0"
+var ASSESS_MIGRATION_YBM_PAYLOAD_VERSION = "1.1"
 
 // ======================= PAYLOAD FOR YUGABYTED =======================
 
@@ -1406,6 +1439,7 @@ type AssessMigrationPayloadYugabyteD struct {
 	MigrationComplexity            string
 	MigrationComplexityExplanation string
 	SchemaSummary                  utils.SchemaSummary
+	ParsedSchemaSummary            ParsedSchemaSummary
 	AssessmentIssues               []AssessmentIssueYugabyteD
 	SourceSizeDetails              SourceDBSizeDetails
 	TargetRecommendations          TargetSizingRecommendations
@@ -1469,6 +1503,7 @@ type AssessMigrationPayloadYBM struct {
 	MigrationComplexity            string                                `json:"MigrationComplexity"`
 	MigrationComplexityExplanation string                                `json:"MigrationComplexityExplanation"`
 	SchemaSummary                  utils.SchemaSummary                   `json:"SchemaSummary"`
+	ParsedSchemaSummary            ParsedSchemaSummary                   `json:"ParsedSchemaSummary"`
 	AssessmentIssues               []AssessmentIssueYBM                  `json:"AssessmentIssues"`
 	SourceSizeDetails              SourceDBSizeDetails                   `json:"SourceSizeDetails"`
 	TargetRecommendations          TargetSizingRecommendations           `json:"TargetRecommendations"`
@@ -1494,6 +1529,93 @@ type AssessmentIssueYBM struct {
 	DocsLink               string                          `json:"DocsLink"`
 	MinimumVersionsFixedIn map[string]*ybversion.YBVersion `json:"MinimumVersionsFixedIn"`
 	Details                map[string]interface{}          `json:"Details,omitempty"`
+}
+
+// ======================= PAYLOAD-SPECIFIC SCHEMA SUMMARY TYPES =======================
+
+type ObjectPayload struct {
+	ObjectName      string `json:"ObjectName"`
+	ParentTableName string `json:"ParentTableName,omitempty"` //Qualified unquoted parent table name
+	SchemaName      string `json:"SchemaName,omitempty"`
+}
+
+type DBObjectPayload struct {
+	ObjectType   string          `json:"ObjectType"`
+	TotalCount   int             `json:"TotalCount"`
+	InvalidCount int             `json:"InvalidCount"`
+	Objects      []ObjectPayload `json:"Objects"`
+	Details      string          `json:"Details,omitempty"`
+}
+
+type ParsedSchemaSummary struct {
+	Description string            `json:"Description"`
+	DBName      string            `json:"DbName"`
+	SchemaNames []string          `json:"SchemaNames"`
+	DBVersion   string            `json:"DbVersion"`
+	Notes       []string          `json:"Notes,omitempty"`
+	DBObjects   []DBObjectPayload `json:"DatabaseObjects"`
+}
+
+func convertSchemaSummaryToPayload(summary utils.SchemaSummary, dbType string) ParsedSchemaSummary {
+	var dbObjects []DBObjectPayload
+	for _, dbObj := range summary.DBObjects {
+		dbObjects = append(dbObjects, DBObjectPayload{
+			ObjectType:   dbObj.ObjectType,
+			TotalCount:   dbObj.TotalCount,
+			InvalidCount: dbObj.InvalidCount,
+			Objects:      parseObjectNamesToPayload(dbObj.ObjectNames, dbObj.ObjectType, dbType),
+			Details:      dbObj.Details,
+		})
+	}
+	return ParsedSchemaSummary{
+		Description: summary.Description,
+		DBName:      summary.DBName,
+		SchemaNames: summary.SchemaNames,
+		DBVersion:   summary.DBVersion,
+		Notes:       summary.Notes,
+		DBObjects:   dbObjects,
+	}
+}
+
+// parseObjectNamesToPayload splits the comma-separated ObjectNames string into individual ObjectPayload entries.
+func parseObjectNamesToPayload(objectNames string, objectType string, dbType string) []ObjectPayload {
+	objectNames = strings.Trim(objectNames, ", ")
+	if objectNames == "" {
+		return nil
+	}
+	names := strings.Split(objectNames, ", ")
+	var objects []ObjectPayload
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		var obj ObjectPayload
+		if slices.Contains([]string{"INDEX", "TRIGGER", "POLICY"}, objectType) {
+			parts := strings.SplitN(name, " ON ", 2)
+			if len(parts) == 2 {
+				tableName := strings.TrimSpace(parts[1])
+				objName := strings.TrimSpace(parts[0])
+				if tableName != "" {
+					tableObj := sqlname.NewObjectNameFromMaybeQualifiedName(dbType, "", tableName)
+					obj.ParentTableName = tableObj.Qualified.Unquoted
+					obj.SchemaName = tableObj.SchemaName.Unquoted
+				}
+				if objName != "" {
+					parsed := sqlname.NewObjectNameFromMaybeQualifiedName(dbType, "", objName)
+					obj.ObjectName = parsed.Unqualified.Unquoted
+				}
+			} else {
+				obj.ObjectName = sqlname.NewObjectNameFromMaybeQualifiedName(dbType, "", name).Unqualified.Unquoted
+			}
+		} else {
+			parsed := sqlname.NewObjectNameFromMaybeQualifiedName(dbType, "", name)
+			obj.ObjectName = parsed.Unqualified.Unquoted
+			obj.SchemaName = parsed.SchemaName.Unquoted
+		}
+		objects = append(objects, obj)
+	}
+	return objects
 }
 
 // RowCountPair holds imported and errored row counts for a table.
@@ -1752,7 +1874,7 @@ func shouldSendCallhome() bool {
 	return bool(callhome.SendDiagnostics) && !startTime.Equal(uninitialisedTimestamp)
 }
 
-func createCallhomePayload() callhome.Payload {
+func createCallhomePayload(migrationUUID uuid.UUID) callhome.Payload {
 	var payload callhome.Payload
 	payload.MigrationUUID = migrationUUID
 	payload.PhaseStartTime = startTime.UTC().Format("2006-01-02 15:04:05.999999")
@@ -1804,6 +1926,8 @@ func PackAndSendCallhomePayloadOnExit() {
 		packAndSendImportDataFilePayload(status, exitErr)
 	case comparePerformanceCmd.CommandPath():
 		packAndSendComparePerformancePayload(status, exitErr, nil)
+	case archiveChangesCmd.CommandPath():
+		packAndSendArchiveChangesPayload(status, exitErr, metaDB, migrationUUID)
 	}
 }
 
@@ -1876,6 +2000,8 @@ func sendCallhomePayloadAtIntervals() {
 			packAndSendImportDataToSrcReplicaPayload(INPROGRESS, nil)
 		case importDataFileCmd.CommandPath():
 			packAndSendImportDataFilePayload(INPROGRESS, nil)
+		case archiveChangesCmd.CommandPath():
+			packAndSendArchiveChangesPayload(INPROGRESS, nil, metaDB, migrationUUID)
 		}
 	}
 }

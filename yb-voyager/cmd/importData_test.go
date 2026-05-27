@@ -143,13 +143,6 @@ FROM generate_series(1, 500000);`
 		if err := runner.Kill(); err != nil {
 			t.Errorf("Failed to kill import command process on run #%d: %v", i+1, err)
 		}
-
-		// Wait for the command to exit.
-		if err := runner.Wait(); err != nil {
-			t.Logf("Async import run #%d exited with error (expected): %v", i+1, err)
-		} else {
-			t.Logf("Async import run #%d completed unexpectedly", i+1)
-		}
 	}
 
 	// Now, resume the import without interruption (synchronous mode) to complete the data import.
@@ -251,13 +244,6 @@ FROM generate_series(1, 500000);`
 		t.Log("Simulating interruption by sending SIGKILL to the import command process...")
 		if err = importDataCmdRunner.Kill(); err != nil {
 			t.Errorf("Failed to kill import command process on run #%d: %v", i+1, err)
-		}
-
-		// Wait for the command to exit.
-		if err = importDataCmdRunner.Wait(); err != nil {
-			t.Logf("Async import run #%d exited with error (expected): %v", i+1, err)
-		} else {
-			t.Logf("Async import run #%d completed unexpectedly", i+1)
 		}
 	}
 
@@ -1242,7 +1228,7 @@ func TestExportAndImportDataSnapshotReport(t *testing.T) {
 	assert.Equal(t, 1, len(statusReport), "Report should contain exactly one entry")
 
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `public."test_data"`,
+		TableName:          `"public"."test_data"`,
 		FileName:           "",
 		ImportedCount:      10,
 		ErroredCount:       0,
@@ -1366,7 +1352,7 @@ func TestExportAndImportDataSnapshotReport_ErrorPolicyStashAndContinue_BatchInge
 	assert.Equal(t, 1, len(statusReport), "Report should contain exactly one entry")
 
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `public."test_data"`,
+		TableName:          `"public"."test_data"`,
 		FileName:           "",
 		ImportedCount:      90,
 		ErroredCount:       10,
@@ -1390,15 +1376,15 @@ func TestExportAndImportDataSnapshotReport_ErrorPolicyStashAndContinue_BatchInge
 	testutils.FatalIfError(t, err, "End migration command failed")
 
 	// Verify that the backup directory contains the expected error files.
-	// error file is expected to be under dir table::test_data/file::test_data_data.sql:1960b25c and of the name ingestion-error.batch::1.10.10.92.E
 	tableDir := fmt.Sprintf("table::%s", tblName.ForKey())
 	fileDir := fmt.Sprintf("file::test_data_data.sql:%s", importdata.ComputePathHash(filepath.Join(exportDir, "data", "test_data_data.sql")))
 	tableFileErrorsDir := filepath.Join(backupDir, "data", "errors", tableDir, fileDir)
-	errorFilePath := filepath.Join(tableFileErrorsDir, "ingestion-error.batch::1.10.10.92.E")
-	assert.FileExistsf(t, errorFilePath, "Expected error file %s to exist", errorFilePath)
+	errorFiles, globErr := filepath.Glob(filepath.Join(tableFileErrorsDir, "ingestion-error.batch::1.10.10.92.*.E"))
+	assert.NoError(t, globErr)
+	assert.Equal(t, 1, len(errorFiles), "Expected exactly one ingestion error file, found: %v", errorFiles)
 
 	// Verify the content of the error file
-	testutils.AssertFileContains(t, errorFilePath, "duplicate key value violates unique constraint")
+	testutils.AssertFileContains(t, errorFiles[0], "duplicate key value violates unique constraint")
 }
 
 func TestImportOfSubsetOfExportedTables(t *testing.T) {
@@ -1523,7 +1509,7 @@ FROM generate_series(1, 10);`
 	//assert error contains table not found
 	assert.NotNil(t, err)
 	assert.Contains(t, importCmd.Stdout(), `Following source tables are not present in the target database:
-test_schema."test_migration1"`)
+"test_schema"."test_migration1"`)
 
 	importCmd = testutils.NewVoyagerCommandRunner(yugabytedbContainer, "import data", []string{
 		"--export-dir", exportDir,
@@ -1573,7 +1559,7 @@ Valid table names are: [test_schema.test_migration]
 
 	assert.Equal(t, 2, len(importReportData), "Report should contain exactly two entries")
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `test_schema."test_migration"`,
+		TableName:          `"test_schema"."test_migration"`,
 		FileName:           "",
 		ImportedCount:      10,
 		ErroredCount:       0,
@@ -1583,7 +1569,7 @@ Valid table names are: [test_schema.test_migration]
 	}, importReportData[0], "Status report row mismatch")
 
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `test_schema."test_migration1"`,
+		TableName:          `"test_schema"."test_migration1"`,
 		FileName:           "",
 		ImportedCount:      0,
 		ErroredCount:       0,
@@ -1617,7 +1603,7 @@ Valid table names are: [test_schema.test_migration]
 	}, exportReportData[1], "Status report row mismatch")
 
 	//verify the sequence last value is restored properly
-	seq1 := `test_schema.test_migration_id_seq`
+	seq1 := `"test_schema".test_migration_id_seq`
 	res1, err := yugabytedbContainer.Query(fmt.Sprintf("SELECT nextval('%s')", seq1))
 	testutils.FatalIfError(t, err, "Failed to query sequence %s", seq1)
 	defer res1.Close()
@@ -1751,7 +1737,7 @@ FROM generate_series(1, 10);`
 	//assert error contains table not found
 	assert.NotNil(t, err)
 	assert.Contains(t, importCmd.Stdout(), `Following source tables are not present in the target database:
-test_schema."test_migration1"`)
+"test_schema"."test_migration1"`)
 
 	importCmd = testutils.NewVoyagerCommandRunner(yugabytedbContainer, "import data", []string{
 		"--export-dir", exportDir,
@@ -1804,7 +1790,7 @@ Valid table names are: [test_schema.test_migration]
 
 	assert.Equal(t, 2, len(importReportData), "Report should contain exactly one entry")
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `test_schema."test_migration"`,
+		TableName:          `"test_schema"."test_migration"`,
 		FileName:           "",
 		ImportedCount:      10,
 		ErroredCount:       0,
@@ -1814,7 +1800,7 @@ Valid table names are: [test_schema.test_migration]
 	}, importReportData[0], "Status report row mismatch")
 
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `test_schema."test_migration1"`,
+		TableName:          `"test_schema"."test_migration1"`,
 		FileName:           "",
 		ImportedCount:      10,
 		ErroredCount:       0,
@@ -1848,8 +1834,8 @@ Valid table names are: [test_schema.test_migration]
 	}, exportReportData[1], "Status report row mismatch")
 
 	//verify the sequence last value is restored properly
-	seq1 := `test_schema.test_migration_id_seq`
-	seq2 := `test_schema.test_migration1_id_seq`
+	seq1 := `"test_schema".test_migration_id_seq`
+	seq2 := `"test_schema".test_migration1_id_seq`
 	res1, err := yugabytedbContainer.Query(fmt.Sprintf("SELECT nextval('%s')", seq1))
 	testutils.FatalIfError(t, err, "Failed to query sequence %s", seq1)
 	defer res1.Close()
@@ -1996,7 +1982,7 @@ FROM generate_series(1, 10);`
 	//assert error contains table not found
 	assert.NotNil(t, err)
 	assert.Contains(t, importCmd.Stdout(), `Following source tables are not present in the target database:
-test_schema."test_migration1"`)
+"test_schema"."test_migration1"`)
 
 	err = testutils.NewVoyagerCommandRunner(yugabytedbContainer, "import data", []string{
 		"--export-dir", exportDir,
@@ -2028,7 +2014,7 @@ test_schema."test_migration1"`)
 
 	assert.Equal(t, 2, len(importReportData), "Report should contain exactly two entries")
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `test_schema."test_migration"`,
+		TableName:          `"test_schema"."test_migration"`,
 		FileName:           "",
 		ImportedCount:      10,
 		ErroredCount:       0,
@@ -2038,7 +2024,7 @@ test_schema."test_migration1"`)
 	}, importReportData[0], "Status report row mismatch")
 
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `test_schema."test_migration1"`,
+		TableName:          `"test_schema"."test_migration1"`,
 		FileName:           "",
 		ImportedCount:      0,
 		ErroredCount:       0,
@@ -2072,7 +2058,7 @@ test_schema."test_migration1"`)
 	}, exportReportData[0], "Status report row mismatch")
 
 	//verify the sequence last value is restored properly
-	seq1 := `test_schema.test_migration_id_seq`
+	seq1 := `"test_schema".test_migration_id_seq`
 	res1, err := yugabytedbContainer.Query(fmt.Sprintf("SELECT nextval('%s')", seq1))
 	testutils.FatalIfError(t, err, "Failed to query sequence %s", seq1)
 	defer res1.Close()
@@ -2193,7 +2179,7 @@ func TestExportAndImportDataSnapshotReport_ErrorPolicyStashAndContinue_Processin
 	assert.Equal(t, 1, len(statusReport), "Report should contain exactly one entry")
 
 	assert.Equal(t, &tableMigStatusOutputRow{
-		TableName:          `public."test_data"`,
+		TableName:          `"public"."test_data"`,
 		FileName:           "",
 		ImportedCount:      99,
 		ErroredCount:       1,
@@ -2226,4 +2212,155 @@ func TestExportAndImportDataSnapshotReport_ErrorPolicyStashAndContinue_Processin
 
 	// Verify the content of the error file
 	testutils.AssertFileContains(t, errorFilePath, "larger than the max batch size")
+}
+
+func TestOfflineImportData_GeneratedAlwaysAsIdentity(t *testing.T) {
+	ctx := context.Background()
+
+	exportDir = testutils.CreateTempExportDir()
+	defer testutils.RemoveTempExportDir(exportDir)
+
+	postgresContainer := testcontainers.NewTestContainer("postgresql", nil)
+	err := postgresContainer.Start(ctx)
+	testutils.FatalIfError(t, err, "Failed to start Postgres container")
+
+	yugabytedbContainer := testcontainers.NewTestContainer("yugabytedb", nil)
+	err = yugabytedbContainer.Start(ctx)
+	testutils.FatalIfError(t, err, "Failed to start YugabyteDB container")
+
+	createSchemaSQL := `CREATE SCHEMA IF NOT EXISTS test_schema;`
+	createTableSQL := `
+CREATE TABLE test_schema.identity_test (
+	id INT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+	name TEXT NOT NULL
+);`
+	insertDataSQL := `
+INSERT INTO test_schema.identity_test (name)
+SELECT 'name_' || g FROM generate_series(1, 100) AS g;`
+	dropSchemaSQL := `DROP SCHEMA IF EXISTS test_schema CASCADE;`
+
+	postgresContainer.ExecuteSqls(createSchemaSQL, createTableSQL, insertDataSQL)
+	defer postgresContainer.ExecuteSqls(dropSchemaSQL)
+
+	// Export schema from PG
+	err = testutils.NewVoyagerCommandRunner(postgresContainer, "export schema", []string{
+		"--export-dir", exportDir,
+		"--source-db-schema", "test_schema",
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "export schema failed")
+
+	// Import schema to YB
+	err = testutils.NewVoyagerCommandRunner(yugabytedbContainer, "import schema", []string{
+		"--export-dir", exportDir,
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "import schema failed")
+
+	// Export data from PG
+	err = testutils.NewVoyagerCommandRunner(postgresContainer, "export data", []string{
+		"--export-dir", exportDir,
+		"--source-db-schema", "test_schema",
+		"--disable-pb", "true",
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "export data failed")
+
+	// Import data to YB
+	err = testutils.NewVoyagerCommandRunner(yugabytedbContainer, "import data", []string{
+		"--export-dir", exportDir,
+		"--disable-pb", "true",
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "import data failed")
+
+	// Compare data between source and target
+	pgConn, err := postgresContainer.GetConnection()
+	testutils.FatalIfError(t, err, "connecting to Postgres")
+	defer pgConn.Close()
+	ybConn, err := yugabytedbContainer.GetConnection()
+	testutils.FatalIfError(t, err, "connecting to YugabyteDB")
+	defer ybConn.Close()
+
+	err = testutils.CompareTableData(ctx, pgConn, ybConn, "test_schema.identity_test", "id")
+	assert.NoError(t, err, "table data mismatch between source and target")
+
+	// Verify the identity column is still GENERATED ALWAYS on the target
+	assertIdentityColumnIsAlways(t, ybConn, "test_schema", "identity_test", "id")
+}
+
+// Regression test: `import data --start-clean true --truncate-tables true` must
+// succeed when the target has a non-empty parent table whose FK-dependent child
+// is empty. Previously cleanImportState() filtered out empty tables before
+// issuing TRUNCATE, so YB rejected the statement with "cannot truncate a table
+// referenced in a foreign key constraint".
+func TestImportData_TruncateTables_FKEmptyChild(t *testing.T) {
+	ctx := context.Background()
+
+	exportDir = testutils.CreateTempExportDir()
+	defer testutils.RemoveTempExportDir(exportDir)
+
+	postgresContainer := testcontainers.NewTestContainer("postgresql", nil)
+	err := postgresContainer.Start(ctx)
+	testutils.FatalIfError(t, err, "Failed to start Postgres container")
+
+	yugabytedbContainer := testcontainers.NewTestContainer("yugabytedb", nil)
+	err = yugabytedbContainer.Start(ctx)
+	testutils.FatalIfError(t, err, "Failed to start YugabyteDB container")
+
+	createSchemaSQL := `CREATE SCHEMA IF NOT EXISTS test_schema;`
+	dropSchemaSQL := `DROP SCHEMA IF EXISTS test_schema CASCADE;`
+	createParentSQL := `
+CREATE TABLE test_schema.projects (
+	project_id   INT PRIMARY KEY,
+	project_name TEXT NOT NULL
+);`
+	createChildSQL := `
+CREATE TABLE test_schema.tasks (
+	task_id      INT PRIMARY KEY,
+	task_name    TEXT NOT NULL,
+	project_id   INT NOT NULL,
+	CONSTRAINT fk_project FOREIGN KEY (project_id) REFERENCES test_schema.projects(project_id)
+);`
+	insertParent := `INSERT INTO test_schema.projects VALUES (1, 'Alpha'), (2, 'Beta');`
+	insertChild := `INSERT INTO test_schema.tasks VALUES (1, 't1', 1), (2, 't2', 2);`
+
+	// Source PG: both parent and child populated.
+	postgresContainer.ExecuteSqls(createSchemaSQL, createParentSQL, createChildSQL, insertParent, insertChild)
+	defer postgresContainer.ExecuteSqls(dropSchemaSQL)
+
+	// Target YB: parent has rows, child (tasks) is empty — this is the bug repro.
+	yugabytedbContainer.ExecuteSqls(createSchemaSQL, createParentSQL, createChildSQL, insertParent)
+	defer yugabytedbContainer.ExecuteSqls(dropSchemaSQL)
+
+	err = testutils.NewVoyagerCommandRunner(postgresContainer, "export data", []string{
+		"--export-dir", exportDir,
+		"--source-db-schema", "test_schema",
+		"--disable-pb", "true",
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "Export command failed")
+
+	err = testutils.NewVoyagerCommandRunner(yugabytedbContainer, "import data", []string{
+		"--export-dir", exportDir,
+		"--start-clean", "true",
+		"--truncate-tables", "true",
+		"--disable-pb", "true",
+		"--yes",
+	}, nil, false).Run()
+	testutils.FatalIfError(t, err, "Import command failed -- TRUNCATE of FK-related tables should succeed when child is empty on target")
+
+	pgConn, err := postgresContainer.GetConnection()
+	testutils.FatalIfError(t, err, "connecting to Postgres")
+	defer pgConn.Close()
+	ybConn, err := yugabytedbContainer.GetConnection()
+	testutils.FatalIfError(t, err, "connecting to YugabyteDB")
+	defer ybConn.Close()
+
+	if err := testutils.CompareTableData(ctx, pgConn, ybConn, "test_schema.projects", "project_id"); err != nil {
+		t.Errorf("projects mismatch: %v", err)
+	}
+	if err := testutils.CompareTableData(ctx, pgConn, ybConn, "test_schema.tasks", "task_id"); err != nil {
+		t.Errorf("tasks mismatch: %v", err)
+	}
 }

@@ -90,10 +90,8 @@ func (ms *MySQL) QueryRow(query string) *sql.Row {
 	return ms.db.QueryRow(query)
 }
 
-func (ms *MySQL) CheckSchemaExists() bool {
-	// no concept of schema in MySQL, only database
-	// also if Connect() passed already that means database is present
-	return true
+func (ms *MySQL) GetAllSchemaNamesIdentifiers() ([]sqlname.Identifier, error) {
+	return nil, nil
 }
 
 func (ms *MySQL) GetTableRowCount(tableName sqlname.NameTuple) (int64, error) {
@@ -289,6 +287,11 @@ func (ms *MySQL) GetDatabaseSize() (int64, error) {
 	return dbSize.Int64, nil
 }
 
+func (ms *MySQL) FetchDBID() error {
+	//Not implemented for mysql
+	return nil
+}
+
 func (ms *MySQL) FilterUnsupportedTables(migrationUUID uuid.UUID, tableList []sqlname.NameTuple, useDebezium bool) ([]sqlname.NameTuple, []sqlname.NameTuple) {
 	return tableList, nil
 }
@@ -326,8 +329,8 @@ func (ms *MySQL) getTableColumns(tableName sqlname.NameTuple) ([]string, []strin
 	return columns, dataTypes, nil, nil
 }
 
-func (ms *MySQL) GetAllSequences() []string {
-	return nil
+func (ms *MySQL) GetSequencesLastValues(sequencesList []sqlname.NameTuple) (*utils.StructMap[sqlname.ObjectName, int64], error) {
+	return nil, nil
 }
 
 func (ms *MySQL) GetAllSequencesRaw(schemaName string) ([]string, error) {
@@ -497,6 +500,13 @@ func (ms *MySQL) GetTableToUniqueKeyColumnsMap(tableList []sqlname.NameTuple) (*
 func (ms *MySQL) ClearMigrationState(migrationUUID uuid.UUID, exportDir string) error {
 	log.Infof("ClearMigrationState not implemented yet for MySQL")
 	return nil
+}
+
+// GetPrimaryKeyColumns is a no-op for MySQL: the partition-aware caller in
+// reportUnsupportedTablesForLiveMigration only iterates leaves built by
+// addLeafPartitionsInTableList, which is itself a no-op for non-PG/YB sources.
+func (ms *MySQL) GetPrimaryKeyColumns(tables []sqlname.NameTuple) (*utils.StructMap[sqlname.NameTuple, []string], error) {
+	panic("not implemented")
 }
 
 func (ms *MySQL) GetNonPKTables() ([]string, error) {

@@ -25,9 +25,8 @@ import (
 	"regexp"
 	"strings"
 
-	goerrors "github.com/go-errors/errors"
-
 	"github.com/fatih/color"
+	goerrors "github.com/go-errors/errors"
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
@@ -36,9 +35,12 @@ import (
 
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/constants"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/cp"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/export"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/metadb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/migassessment"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/namereg"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/query/sqltransformer"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/srcdb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils/sqlname"
 )
@@ -91,6 +93,7 @@ func exportSchema(cmd *cobra.Command) error {
 			}
 			clearSchemaIsExported()
 			clearAssessmentRecommendationsApplied()
+			clearMigrationAssessmentDoneViaExportSchema()
 		} else {
 			fmt.Fprintf(os.Stderr, "Schema is already exported. "+
 				"Use --start-clean flag to export schema again -- "+
@@ -100,7 +103,7 @@ func exportSchema(cmd *cobra.Command) error {
 	} else if startClean {
 		utils.PrintAndLogf("Schema is not exported yet. Ignoring --start-clean flag.\n\n")
 	}
-	CreateMigrationProjectIfNotExists(source.DBType, exportDir)
+	metaDB = CreateMigrationProjectIfNotExists(source.DBType, exportDir)
 	err := retrieveMigrationUUID()
 	if err != nil {
 		log.Errorf("failed to get migration UUID: %v", err)
@@ -112,6 +115,8 @@ func exportSchema(cmd *cobra.Command) error {
 		log.Errorf("failed to connect to the source db: %s", err)
 		return fmt.Errorf("failed to connect to the source db during export schema: %w", err)
 	}
+	//TODO: fix in next PR
+	source.Schemas = sqlname.ParseIdentifiersFromString(source.DBType, source.SchemaConfig, ",")
 	defer source.DB().Disconnect()
 
 	if source.RunGuardrailsChecks {
@@ -123,12 +128,26 @@ func exportSchema(cmd *cobra.Command) error {
 		}
 
 		// Check if required binaries are installed.
-		binaryCheckIssues, err := checkDependenciesForExport()
+		binaryCheckIssues, err := export.CheckDependencies(
+			source.DBType,
+			source.DB().GetVersion(),
+			exportType,
+			useDebezium,
+		)
 		if err != nil {
 			return fmt.Errorf("failed to check dependencies for export schema: %w", err)
 		} else if len(binaryCheckIssues) > 0 {
 			return goerrors.Errorf("\n%s\n%s", color.RedString("\nMissing dependencies for export schema:"), strings.Join(binaryCheckIssues, "\n"))
 		}
+	}
+
+	allSchemas, err := source.DB().GetAllSchemaNamesIdentifiers()
+	if err != nil {
+		return fmt.Errorf("failed to get all schema names identifiers: %w", err)
+	}
+	source.Schemas, err = namereg.SchemaNameMatcher(source.DBType, allSchemas, source.SchemaConfig)
+	if err != nil {
+		return fmt.Errorf("failed to match schema names: %w", err)
 	}
 
 	checkSourceDBCharset()
@@ -140,17 +159,18 @@ func exportSchema(cmd *cobra.Command) error {
 	}
 
 	// Get PostgreSQL system identifier while still connected
-	source.FetchDBSystemIdentifier()
-	utils.PrintAndLogf("%s version: %s\n", source.DBType, sourceDBVersion)
-
-	res := source.DB().CheckSchemaExists()
-	if !res {
-		return goerrors.Errorf("failed to check if source schema exist during export schema: %q", source.Schema)
+	source.FetchPGDBSystemIdentifier()
+	err = source.DB().FetchDBID()
+	if err != nil {
+		log.Errorf("error getting database id: %v", err) //can just log as this is used for call-home only
 	}
+	utils.PrintAndLogf("%s version: %s\n", source.DBType, sourceDBVersion)
 
 	// Check if the source database has the required permissions for exporting schema.
 	if source.RunGuardrailsChecks {
-		checkIfSchemasHaveUsagePermissions()
+		if err := srcdb.CheckSchemasHaveUsagePermissions(&source, export.ChangeStreamingIsEnabled(exportType)); err != nil {
+			return fmt.Errorf("schema usage permission check failed: %w", err)
+		}
 		missingPerms, err := source.DB().GetMissingExportSchemaPermissions("")
 		if err != nil {
 			return fmt.Errorf("failed to get missing export schema permissions: %w", err)
@@ -262,7 +282,9 @@ func runAssessMigrationCmdBeforExportSchemaIfRequired(exportSchemaCmd *cobra.Com
 	if ok, _ := IsMigrationAssessmentDoneDirectly(metaDB); ok {
 		log.Infof("migration assessment is already done, skipping running assess-migration command.")
 		return nil
-	} else if ok, _ := IsMigrationAssessmentDoneViaExportSchema(); ok {
+	}
+
+	if ok, _ := IsMigrationAssessmentDoneViaExportSchema(); ok {
 		log.Infof("migration assessment is already done via export schema, skipping running assess-migration command.")
 		return nil
 	}
@@ -399,6 +421,15 @@ func clearSchemaIsExported() {
 	})
 	if err != nil {
 		utils.ErrExit("clear schema is exported: update migration status record: %w", err)
+	}
+}
+
+func clearMigrationAssessmentDoneViaExportSchema() {
+	err := metaDB.UpdateMigrationStatusRecord(func(record *metadb.MigrationStatusRecord) {
+		record.MigrationAssessmentDoneViaExportSchema = false
+	})
+	if err != nil {
+		utils.ErrExit("clear migration assessment done via export schema: update migration status record: %w", err)
 	}
 }
 
@@ -791,10 +822,12 @@ func applyIndexFileTransformations() (*sqltransformer.IndexFileTransformer, erro
 	//assuming that assessment is run and fetched the redundant indexes
 	//TODO: see if we need to take care of the scenario where assessment is unable to fetch these
 	var err error
-	var redundantIndexToResolvedExistingIndex *utils.StructMap[*sqlname.ObjectNameQualifiedWithTableName, string]
+	redundantIndexToResolvedExistingIndex := utils.NewStructMap[*sqlname.ObjectNameQualifiedWithTableName, string]()
 	redundantIndexToResolvedExistingIndex, err = fetchRedundantIndexMapFromAssessmentDB()
 	if err != nil {
 		if skipPerfOptimizations {
+			//this is done to handle errors but if skip is used we need to put the redundant indexes in the schema optimization report
+			//so can't skip fetching the redundant indexes in this case
 			log.Infof("skipping error while fetching redundant index map from assessment db: %v", err)
 			return nil, nil
 		}

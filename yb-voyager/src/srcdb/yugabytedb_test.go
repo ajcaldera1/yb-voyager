@@ -19,6 +19,7 @@ package srcdb
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/samber/lo"
@@ -50,7 +51,7 @@ func TestYugabyteGetAllTableNames(t *testing.T) {
 	defer testYugabyteDBSource.TestContainer.ExecuteSqls(`DROP SCHEMA test_schema CASCADE;`)
 
 	sqlname.SourceDBType = "postgresql"
-	testYugabyteDBSource.Source.Schema = "test_schema" // setting schema to look for tables in
+	testYugabyteDBSource.Source.Schemas = []sqlname.Identifier{sqlname.NewIdentifier("postgresql", "test_schema")} // setting schema to look for tables in
 
 	// Test GetAllTableNames
 	actualTables := testYugabyteDBSource.DB().GetAllTableNames()
@@ -199,16 +200,16 @@ func TestYugabyteGetColumnToSequenceMap(t *testing.T) {
 	fmt.Print("--- Full table list case ---- \n")
 	actualColumnToSequenceMap := testYugabyteDBSource.DB().GetColumnToSequenceMap(tableList)
 	expectedColumnToSequenceMap := map[string]string{
-		"public.serial_table.id":                   `public."serial_table_id_seq"`,
-		"public.bigserial_table.id":                `public."bigserial_table_id_seq"`,
-		"public.identity_always_table.id":          `public."identity_always_table_id_seq"`,
-		"public.identity_default_table.id":         `public."identity_default_table_id_seq"`,
-		"public.default_nextval_table.id":          `public."manual_seq"`,
-		"public.cross_schema_default_seq_table.id": `custom_schema."cross_schema_seq"`,
-		"public.manual_linked_table.id":            `public."manual_linked_seq"`,
-		"custom_schema.users.user_code":            `custom_schema."user_code_seq"`,
-		"public.manual_linked_table_1.id":          `public."manual_linked_seq_another"`,
-		"public.manual_linked_table_2.id":          `public."manual_linked_seq_another"`,
+		"public.serial_table.id":                   `"public"."serial_table_id_seq"`,
+		"public.bigserial_table.id":                `"public"."bigserial_table_id_seq"`,
+		"public.identity_always_table.id":          `"public"."identity_always_table_id_seq"`,
+		"public.identity_default_table.id":         `"public"."identity_default_table_id_seq"`,
+		"public.default_nextval_table.id":          `"public"."manual_seq"`,
+		"public.cross_schema_default_seq_table.id": `"custom_schema"."cross_schema_seq"`,
+		"public.manual_linked_table.id":            `"public"."manual_linked_seq"`,
+		"custom_schema.users.user_code":            `"custom_schema"."user_code_seq"`,
+		"public.manual_linked_table_1.id":          `"public"."manual_linked_seq_another"`,
+		"public.manual_linked_table_2.id":          `"public"."manual_linked_seq_another"`,
 	}
 	assert.Equal(t, len(lo.Keys(actualColumnToSequenceMap)), len(lo.Keys(expectedColumnToSequenceMap)), "Expected number of tables to match")
 	//asssert key val
@@ -227,18 +228,18 @@ func TestYugabyteGetColumnToSequenceMap(t *testing.T) {
 		testutils.CreateNameTupleWithSourceName("public.manual_linked_table", "public", testPostgresSource.DBType),
 		testutils.CreateNameTupleWithSourceName("public.manual_linked_table_1", "public", testPostgresSource.DBType),
 	}
-	testPostgresSource.Source.Schema = "public|custom_schema"
+	testPostgresSource.Source.Schemas = sqlname.ParseIdentifiersFromString("postgresql", "public|custom_schema", "|")
 
 	// Test GetColumnToSequenceMap
 	fmt.Print("----- Subset of table list case ----- \n")
 	actualColumnToSequenceMap = testYugabyteDBSource.DB().GetColumnToSequenceMap(tableList)
 	expectedColumnToSequenceMap = map[string]string{
-		"public.serial_table.id":                   `public."serial_table_id_seq"`,
-		"public.bigserial_table.id":                `public."bigserial_table_id_seq"`,
-		"public.identity_always_table.id":          `public."identity_always_table_id_seq"`,
-		"public.cross_schema_default_seq_table.id": `custom_schema."cross_schema_seq"`,
-		"public.manual_linked_table.id":            `public."manual_linked_seq"`,
-		"public.manual_linked_table_1.id":          `public."manual_linked_seq_another"`,
+		"public.serial_table.id":                   `"public"."serial_table_id_seq"`,
+		"public.bigserial_table.id":                `"public"."bigserial_table_id_seq"`,
+		"public.identity_always_table.id":          `"public"."identity_always_table_id_seq"`,
+		"public.cross_schema_default_seq_table.id": `"custom_schema"."cross_schema_seq"`,
+		"public.manual_linked_table.id":            `"public"."manual_linked_seq"`,
+		"public.manual_linked_table_1.id":          `"public"."manual_linked_seq_another"`,
 	}
 	assert.Equal(t, len(lo.Keys(actualColumnToSequenceMap)), len(lo.Keys(expectedColumnToSequenceMap)), "Expected number of tables to match")
 	//asssert key val
@@ -320,13 +321,13 @@ func TestYugabyteGetNonPKTables(t *testing.T) {
 		name VARCHAR(255)
 	);`)
 	defer testYugabyteDBSource.TestContainer.ExecuteSqls(`DROP SCHEMA test_schema CASCADE;`)
-	testYugabyteDBSource.Source.Schema = "test_schema" // setting schema to look for tables in
+	testYugabyteDBSource.Source.Schemas = []sqlname.Identifier{sqlname.NewIdentifier("postgresql", "test_schema")} // setting schema to look for tables in
 
 	// Test GetNonPKTables
 	actualTables, err := testYugabyteDBSource.DB().GetNonPKTables()
 	assert.NilError(t, err, "Expected nil but non nil error: %v", err)
 
-	expectedTables := []string{`test_schema."non_pk2"`, `test_schema."non_pk1"`} // func returns table.Qualified.Quoted
+	expectedTables := []string{`"test_schema"."non_pk2"`, `"test_schema"."non_pk1"`} // func returns table.Qualified.Quoted
 	testutils.AssertEqualStringSlices(t, expectedTables, actualTables)
 }
 
@@ -589,7 +590,6 @@ func TestYugabyteFilterUnsupportedUserDefinedDatatypes(t *testing.T) {
 		"Expected %d UDTs but got %d", len(expectedRangesUDTs), len(actualUDTsWithRanges))
 	testutils.AssertEqualStringSlices(t, expectedRangesUDTs, actualUDTsWithRanges)
 
-
 }
 
 // TestYugabyteGetColumnsWithSupportedTypes_AllScenarios tests:
@@ -654,6 +654,12 @@ func TestYugabyteGetColumnsWithSupportedTypes_AllScenarios(t *testing.T) {
 			name VARCHAR,
 			budget NUMERIC
 		);`,
+
+		// Case 5: TIMETZ types (unsupported in Debezium live migration)
+		`CREATE TABLE hr.timetz_table (
+			id INT PRIMARY KEY,
+			reminder_at TIMETZ
+		);`,
 	)
 	defer testYugabyteDBSource.TestContainer.ExecuteSqls(
 		`DROP SCHEMA custom_ext CASCADE;`,
@@ -667,6 +673,7 @@ func TestYugabyteGetColumnsWithSupportedTypes_AllScenarios(t *testing.T) {
 		testutils.CreateNameTupleWithSourceName("hr.employee_devices", "hr", constants.YUGABYTEDB),
 		testutils.CreateNameTupleWithSourceName("custom_ext.\"SearchTable\"", "custom_ext", constants.YUGABYTEDB),
 		testutils.CreateNameTupleWithSourceName("hr.projects", "hr", constants.YUGABYTEDB),
+		testutils.CreateNameTupleWithSourceName("hr.timetz_table", "hr", constants.YUGABYTEDB),
 	}
 
 	// ========== Test 1: Logical Connector (TSVECTOR and HSTORE supported) ==========
@@ -712,6 +719,16 @@ func TestYugabyteGetColumnsWithSupportedTypes_AllScenarios(t *testing.T) {
 
 		_, exists = unsupportedCols.Get(projectsTable)
 		assert.Equal(t, false, exists, "Expected hr.projects NOT in unsupported map")
+
+		// Case 5: timetz_table - TIMETZ is UNSUPPORTED in Debezium live migration
+		timetzTable := tableList[4]
+		supported, exists = supportedCols.Get(timetzTable)
+		assert.Equal(t, true, exists, "Expected hr.timetz_table in supported map")
+		testutils.AssertEqualStringSlices(t, []string{"id"}, supported)
+
+		unsupported, exists := unsupportedCols.Get(timetzTable)
+		assert.Equal(t, true, exists, "Expected hr.timetz_table in unsupported map")
+		testutils.AssertEqualStringSlices(t, []string{"reminder_at"}, unsupported)
 	})
 
 	// ========== Test 2: GRPC Connector (TSVECTOR and HSTORE unsupported) ==========
@@ -749,6 +766,16 @@ func TestYugabyteGetColumnsWithSupportedTypes_AllScenarios(t *testing.T) {
 		unsupported, exists = unsupportedCols.Get(searchTable)
 		assert.Equal(t, true, exists, "Expected custom_ext.SearchTable in unsupported map")
 		testutils.AssertEqualStringSlices(t, []string{"SearchVector"}, unsupported) // TSVECTOR unsupported in GRPC, mixed case
+
+		// Case 5: timetz_table - TIMETZ is UNSUPPORTED in Debezium live migration
+		timetzTable := tableList[4]
+		supported, exists = supportedCols.Get(timetzTable)
+		assert.Equal(t, true, exists, "Expected hr.timetz_table in supported map")
+		testutils.AssertEqualStringSlices(t, []string{"id"}, supported)
+
+		unsupported, exists = unsupportedCols.Get(timetzTable)
+		assert.Equal(t, true, exists, "Expected hr.timetz_table in unsupported map")
+		testutils.AssertEqualStringSlices(t, []string{"reminder_at"}, unsupported)
 	})
 
 	// ========== Test 3: Offline Migration (all types supported) ==========
@@ -760,4 +787,230 @@ func TestYugabyteGetColumnsWithSupportedTypes_AllScenarios(t *testing.T) {
 		assert.Equal(t, 0, len(supportedCols.Keys()), "Expected empty supported map for offline migration")
 		assert.Equal(t, 0, len(unsupportedCols.Keys()), "Expected empty unsupported map for offline migration")
 	})
+}
+
+func TestYugabyteReplicaIdentityGuardrail(t *testing.T) {
+	// In YugabyteDB, the default replica identity for new tables is already CHANGE ('c'),
+	// unlike PostgreSQL which defaults to DEFAULT ('d'). To test a table without CHANGE
+	// identity we must explicitly alter it.
+	//
+	// YugabyteDB supports four replica identity modes (INDEX is not supported):
+	//   c = CHANGE   (YB default — only changed columns; NOT reported)
+	//   d = DEFAULT  (PK columns only)
+	//   f = FULL     (all columns)
+	//   n = NOTHING  (nothing)
+	// All modes other than CHANGE should be reported as missing.
+	testYugabyteDBSource.TestContainer.ExecuteSqls(
+		`CREATE SCHEMA ri_test;`,
+		// CHANGE identity (YB default — should NOT be reported)
+		`CREATE TABLE ri_test.with_change_identity (id INT PRIMARY KEY, name VARCHAR(100));`,
+		// FULL identity
+		`CREATE TABLE ri_test.with_full_identity (id INT PRIMARY KEY, name VARCHAR(100));`,
+		`ALTER TABLE ri_test.with_full_identity REPLICA IDENTITY FULL;`,
+		// DEFAULT identity ('d')
+		`CREATE TABLE ri_test.with_default_identity (id INT PRIMARY KEY, name VARCHAR(100));`,
+		`ALTER TABLE ri_test.with_default_identity REPLICA IDENTITY DEFAULT;`,
+		// NOTHING identity ('n')
+		`CREATE TABLE ri_test.with_nothing_identity (id INT PRIMARY KEY, name VARCHAR(100));`,
+		`ALTER TABLE ri_test.with_nothing_identity REPLICA IDENTITY NOTHING;`,
+		// Case-sensitive schema and table names
+		`CREATE SCHEMA "RiTest";`,
+		`CREATE TABLE "RiTest"."CaseSensitive" (id INT PRIMARY KEY, name VARCHAR(100));`,
+		`ALTER TABLE "RiTest"."CaseSensitive" REPLICA IDENTITY FULL;`,
+		`CREATE TABLE "RiTest"."WithChange" (id INT PRIMARY KEY, name VARCHAR(100));`,
+	)
+	defer testYugabyteDBSource.TestContainer.ExecuteSqls(
+		`DROP SCHEMA ri_test CASCADE;`,
+		`DROP SCHEMA "RiTest" CASCADE;`,
+	)
+
+	ybDB := testYugabyteDBSource.DB().(*YugabyteDB)
+
+	tableWithChange := testutils.CreateNameTupleWithSourceName("ri_test.with_change_identity", "ri_test", constants.YUGABYTEDB)
+	tableWithFull := testutils.CreateNameTupleWithSourceName("ri_test.with_full_identity", "ri_test", constants.YUGABYTEDB)
+	tableWithDefault := testutils.CreateNameTupleWithSourceName("ri_test.with_default_identity", "ri_test", constants.YUGABYTEDB)
+	tableWithNothing := testutils.CreateNameTupleWithSourceName("ri_test.with_nothing_identity", "ri_test", constants.YUGABYTEDB)
+	caseSensitiveMissing := testutils.CreateNameTupleWithSourceName(`"RiTest"."CaseSensitive"`, "RiTest", constants.YUGABYTEDB)
+	caseSensitiveChange := testutils.CreateNameTupleWithSourceName(`"RiTest"."WithChange"`, "RiTest", constants.YUGABYTEDB)
+
+	// Case 1: Table with default YB replica identity (CHANGE) → should NOT appear in result
+	t.Run("TableWithChangeReplicaIdentityNotMissing", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{tableWithChange})
+		assert.NilError(t, err)
+		assert.Equal(t, 0, len(result), "Expected no tables missing replica identity CHANGE, got: %v", result)
+	})
+
+	// Case 2: Table with REPLICA IDENTITY FULL → IS in result
+	t.Run("TableWithFullReplicaIdentityIsMissing", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{tableWithFull})
+		assert.NilError(t, err)
+		assert.Equal(t, 1, len(result), "Expected 1 table missing replica identity CHANGE, got: %v", result)
+		assert.Equal(t, tableWithFull, result[0])
+	})
+
+	// Case 3: Table with REPLICA IDENTITY DEFAULT ('d') → IS in result
+	t.Run("TableWithDefaultReplicaIdentityIsMissing", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{tableWithDefault})
+		assert.NilError(t, err)
+		assert.Equal(t, 1, len(result), "Expected 1 table missing replica identity CHANGE, got: %v", result)
+		assert.Equal(t, tableWithDefault, result[0])
+	})
+
+	// Case 4: Table with REPLICA IDENTITY NOTHING ('n') → IS in result
+	t.Run("TableWithNothingReplicaIdentityIsMissing", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{tableWithNothing})
+		assert.NilError(t, err)
+		assert.Equal(t, 1, len(result), "Expected 1 table missing replica identity CHANGE, got: %v", result)
+		assert.Equal(t, tableWithNothing, result[0])
+	})
+
+	// Case 5: All three non-CHANGE types together → all three reported
+	t.Run("AllNonChangeTypesAllReported", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{
+			tableWithFull, tableWithDefault, tableWithNothing,
+		})
+		assert.NilError(t, err)
+		assert.Equal(t, 3, len(result), "Expected all 3 non-CHANGE tables to be reported, got: %v", result)
+	})
+
+	// Case 6: Mixed list (CHANGE + all non-CHANGE types) → only non-CHANGE tables appear
+	t.Run("MixedListOnlyNonChangeAppears", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{
+			tableWithChange, tableWithFull, tableWithDefault, tableWithNothing,
+		})
+		assert.NilError(t, err)
+		assert.Equal(t, 3, len(result), "Expected 3 tables missing replica identity CHANGE, got: %v", result)
+	})
+
+	// Case 8: Case-sensitive quoted names — missing table uses quoted output format
+	t.Run("CaseSensitiveTableNameIsMissing", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{caseSensitiveMissing})
+		assert.NilError(t, err)
+		assert.Equal(t, 1, len(result), "Expected 1 table missing replica identity CHANGE, got: %v", result)
+		assert.Equal(t, caseSensitiveMissing, result[0])
+	})
+
+	// Case 9: Case-sensitive quoted name with CHANGE identity → NOT reported
+	t.Run("CaseSensitiveTableWithChangeNotMissing", func(t *testing.T) {
+		result, err := ybDB.listTablesMissingReplicaIdentityChange([]sqlname.NameTuple{caseSensitiveChange})
+		assert.NilError(t, err)
+		assert.Equal(t, 0, len(result), "Expected no tables missing replica identity CHANGE, got: %v", result)
+	})
+
+	// Case 10: exportType = "snapshot-only" → check skipped, empty result, hasMissing = false
+	t.Run("SnapshotOnlyExportTypeSkipsCheck", func(t *testing.T) {
+		ybDB.source.IsYBGrpcConnector = false
+		msgs, hasMissing, err := ybDB.GetMissingExportDataPermissions(utils.SNAPSHOT_ONLY, []sqlname.NameTuple{tableWithFull})
+		assert.NilError(t, err)
+		assert.Equal(t, false, hasMissing)
+		assert.Equal(t, 0, len(msgs))
+	})
+
+	// Case 11: exportType = "changes-only" → missing table appears in result
+	t.Run("ChangesOnlyExportTypeDetectsMissing", func(t *testing.T) {
+		ybDB.source.IsYBGrpcConnector = false
+		msgs, hasMissing, err := ybDB.GetMissingExportDataPermissions(utils.CHANGES_ONLY, []sqlname.NameTuple{tableWithFull})
+		assert.NilError(t, err)
+		assert.Equal(t, true, hasMissing)
+		assert.Equal(t, 1, len(msgs))
+	})
+
+	// Case 12: exportType = "snapshot-and-changes" → missing table appears in result
+	t.Run("SnapshotAndChangesExportTypeDetectsMissing", func(t *testing.T) {
+		ybDB.source.IsYBGrpcConnector = false
+		msgs, hasMissing, err := ybDB.GetMissingExportDataPermissions(utils.SNAPSHOT_AND_CHANGES, []sqlname.NameTuple{tableWithFull})
+		assert.NilError(t, err)
+		assert.Equal(t, true, hasMissing)
+		assert.Equal(t, 1, len(msgs))
+	})
+
+	// Case 13: IsYBGrpcConnector = true → check skipped entirely, empty result
+	t.Run("GRPCConnectorSkipsCheck", func(t *testing.T) {
+		ybDB.source.IsYBGrpcConnector = true
+		msgs, hasMissing, err := ybDB.GetMissingExportDataPermissions(utils.CHANGES_ONLY, []sqlname.NameTuple{tableWithFull})
+		assert.NilError(t, err)
+		assert.Equal(t, false, hasMissing)
+		assert.Equal(t, 0, len(msgs))
+		ybDB.source.IsYBGrpcConnector = false // restore
+	})
+}
+
+func TestYugabyteGetPrimaryKeyColumns(t *testing.T) {
+	testYugabyteDBSource.TestContainer.ExecuteSqls(
+		`CREATE SCHEMA test_schema;`,
+		`CREATE SCHEMA "TestSchemaCase";`,
+
+		// Single-column PK.
+		`CREATE TABLE test_schema.simple_pk (
+			id SERIAL PRIMARY KEY,
+			name VARCHAR(100)
+		);`,
+
+		// Composite PK declared as (region, id) so the result must preserve
+		// that exact order; (region, id) and (id, region) are different keys
+		// and the live-migration guardrail compares the slices for equality.
+		`CREATE TABLE "TestSchemaCase".composite_pk (
+			region TEXT NOT NULL,
+			id INT NOT NULL,
+			payload TEXT,
+			PRIMARY KEY (region, id)
+		);`,
+
+		// Table with no PK -- must be absent from the resulting map (not an error).
+		`CREATE TABLE test_schema.no_pk (
+			id INT,
+			data TEXT
+		);`,
+
+		// Case-sensitive (quoted) schema and table to exercise identifier matching.
+		`CREATE TABLE "TestSchemaCase"."Orders" (
+			order_id INT PRIMARY KEY,
+			note TEXT
+		);`,
+	)
+	defer testYugabyteDBSource.TestContainer.ExecuteSqls(
+		`DROP SCHEMA test_schema CASCADE;`,
+		`DROP SCHEMA "TestSchemaCase" CASCADE;`,
+	)
+	testYugabyteDBSource.Schemas = []sqlname.Identifier{
+		sqlname.NewIdentifier("postgresql", "test_schema"),
+		sqlname.NewIdentifier("postgresql", "TestSchemaCase"),
+	}
+
+	inputTables := []sqlname.NameTuple{
+		testutils.CreateNameTupleWithSourceName("test_schema.simple_pk", "test_schema", constants.YUGABYTEDB),
+		testutils.CreateNameTupleWithSourceName("\"TestSchemaCase\".composite_pk", "TestSchemaCase", constants.YUGABYTEDB),
+		testutils.CreateNameTupleWithSourceName("test_schema.no_pk", "test_schema", constants.YUGABYTEDB),
+		testutils.CreateNameTupleWithSourceName(`"TestSchemaCase"."Orders"`, "TestSchemaCase", constants.YUGABYTEDB),
+	}
+
+	_ = testYugabyteDBSource.DB().Connect()
+	actualPKColumns, err := testYugabyteDBSource.DB().GetPrimaryKeyColumns(inputTables)
+	assert.NilError(t, err, "Expected nil but non nil error: %v", err)
+
+	expectedPKColumns := utils.NewStructMap[sqlname.NameTuple, []string]()
+	expectedPKColumns.Put(testutils.CreateNameTupleWithSourceName("test_schema.simple_pk", "test_schema", constants.YUGABYTEDB), []string{"id"})
+	expectedPKColumns.Put(testutils.CreateNameTupleWithSourceName("\"TestSchemaCase\".composite_pk", "TestSchemaCase", constants.YUGABYTEDB), []string{"region", "id"})
+	expectedPKColumns.Put(testutils.CreateNameTupleWithSourceName(`"TestSchemaCase"."Orders"`, "TestSchemaCase", constants.YUGABYTEDB), []string{"order_id"})
+
+	expectedPKColumns.IterKV(func(table sqlname.NameTuple, expectedColumns []string) (bool, error) {
+		actualColumns, exists := actualPKColumns.Get(table)
+		if !exists {
+			t.Errorf("Expected table %s not found in actual PK columns map", table.ForOutput())
+			return true, nil
+		}
+		// Order matters for PKs -- compare positionally instead of as sets.
+		if !slices.Equal(expectedColumns, actualColumns) {
+			t.Errorf("PK columns mismatch for %s. Expected: %v, Actual: %v",
+				table.ForOutput(), expectedColumns, actualColumns)
+		}
+		return true, nil
+	})
+
+	// no_pk has no primary key, so it must be absent from the result map.
+	noPKTable := testutils.CreateNameTupleWithSourceName("test_schema.no_pk", "test_schema", "postgresql")
+	if cols, exists := actualPKColumns.Get(noPKTable); exists {
+		t.Errorf("Table %s has no PK and should be absent from result map; got %v",
+			noPKTable.ForOutput(), cols)
+	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
+
 	"github.com/yugabyte/yb-voyager/yb-voyager/versions"
 )
 
@@ -31,12 +32,17 @@ type TestContainer interface {
 	GetConfig() ContainerConfig
 	GetConnectionString() string
 	GetConnection() (*sql.DB, error)
+	GetConnectionWithDB(dbName string) (*sql.DB, error)
 	GetVersion() (string, error)
 
 	// SQL helpers
 	Query(sql string, args ...interface{}) (*sql.Rows, error)
 	ExecuteSqls(sqls ...string)
 
+	QueryOnDB(dbName string, sql string, args ...interface{}) (*sql.Rows, error)
+	ExecuteSqlsOnDB(dbName string, sqls ...string)
+
+	SetConfig(config ContainerConfig)
 	/*
 		TODOs
 			1. // Function to run sql script for a specific test case
@@ -70,6 +76,10 @@ func (config *ContainerConfig) buildContainerName(dbType string) string {
 	return containerName
 }
 
+func (config *ContainerConfig) SetDBName(dbName string) {
+	config.DBName = dbName
+}
+
 func NewTestContainer(dbType string, containerConfig *ContainerConfig) TestContainer {
 	registryMutex.Lock()
 	defer registryMutex.Unlock()
@@ -84,6 +94,7 @@ func NewTestContainer(dbType string, containerConfig *ContainerConfig) TestConta
 	containerName := containerConfig.buildContainerName(dbType)
 	if container, exists := containerRegistry[containerName]; exists {
 		log.Infof("container '%s' already exists in the registry", containerName)
+		container.SetConfig(*containerConfig)
 		return container
 	}
 
@@ -152,7 +163,7 @@ func setContainerConfigDefaultsIfNotProvided(dbType string, config *ContainerCon
 
 	pgVersion := os.Getenv("PG_VERSION")
 	if pgVersion == "" {
-		pgVersion = "14"
+		pgVersion = "17"
 	}
 
 	oracleVersion := os.Getenv("ORACLE_VERSION")

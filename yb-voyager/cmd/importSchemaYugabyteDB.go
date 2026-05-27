@@ -22,9 +22,8 @@ import (
 	"strings"
 	"time"
 
-	goerrors "github.com/go-errors/errors"
-
 	"github.com/fatih/color"
+	goerrors "github.com/go-errors/errors"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/samber/lo"
@@ -34,6 +33,7 @@ import (
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/errs"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/query/queryparser"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils/sqlname"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/ybversion"
 )
 
@@ -175,6 +175,10 @@ func executeSqlFile(file string, objType string, skipFn func(string, string) boo
 }
 
 func isSessionVariable(stmt string) (bool, error) {
+	stmtForCheck := strings.TrimSpace(strings.ToUpper(stmt))
+	if !strings.HasPrefix(stmtForCheck, "SET") {
+		return false, nil
+	}
 	parseTree, err := queryparser.Parse(stmt)
 	if err != nil {
 		return false, fmt.Errorf("error parsing statement: %w", err)
@@ -206,6 +210,14 @@ func shouldSkipDDL(stmt string, objType string) (bool, error) {
 	skipReplicaIdentity := strings.Contains(stmt, "ALTER TABLE") && strings.Contains(stmt, "REPLICA IDENTITY")
 	if skipReplicaIdentity {
 		return true, nil
+	}
+	stmtForCheck := strings.TrimSpace(strings.ToUpper(stmt))
+	if !strings.HasPrefix(stmtForCheck, "ALTER TABLE") {
+		//We should not use parser for every statement as some DDL statement can have YB specific syntax like SPLIT INTO x tablets, PRIMARY KEY (x HASH)
+		//but we right now use PG parser to parse the statement so it fails with syntax error for such statements so we are skipping the parser for such statements
+		//and only parsing the ALTER statements as ALTER most doesn't have support for any YB specific syntax as per docs, but one case where it is possible is
+		//ALTER TABLE ADD PRIMARY KEY (x HASH), but in most cases we don't have ADD PK DDL via voyager schema export
+		return bool(flagPostSnapshotImport), nil
 	}
 	isNotValid, err := isNotValidConstraint(stmt)
 	if err != nil {
@@ -635,21 +647,23 @@ func getNoticeMessage(n *pgconn.Notice) string {
 
 // TODO: Eventually get rid of this function in favour of TargetYugabyteDB.setTargetSchema().
 func setTargetSchema(conn *pgx.Conn) {
-	if sourceDBType == POSTGRESQL || tconf.Schema == YUGABYTEDB_DEFAULT_SCHEMA {
+	if sourceDBType == POSTGRESQL || (len(tconf.Schemas) == 1 && tconf.Schemas[0].Unquoted == YUGABYTEDB_DEFAULT_SCHEMA) {
 		// For PG, schema name is already included in the object name.
 		// No need to set schema if importing in the default schema.
 		return
 	}
-	checkSchemaExistsQuery := fmt.Sprintf("SELECT count(schema_name) FROM information_schema.schemata WHERE schema_name = '%s'", tconf.Schema)
+	schemas := sqlname.JoinIdentifiersUnquoted(tconf.Schemas, "','")
+	checkSchemaExistsQuery := fmt.Sprintf("SELECT count(schema_name) FROM information_schema.schemata WHERE schema_name IN ('%s')", schemas)
 	var cntSchemaName int
 
 	if err := conn.QueryRow(context.Background(), checkSchemaExistsQuery).Scan(&cntSchemaName); err != nil {
 		utils.ErrExit("run query: %q on target %q to check schema exists: %s", checkSchemaExistsQuery, tconf.Host, err)
-	} else if cntSchemaName == 0 {
-		utils.ErrExit("schema does not exist in target: %q", tconf.Schema)
+	} else if cntSchemaName < len(tconf.Schemas) {
+		utils.ErrExit("schemas do not exist in target: %q", schemas)
 	}
 
-	setSchemaQuery := fmt.Sprintf("SET SCHEMA '%s'", tconf.Schema)
+	setSchemas := sqlname.JoinIdentifiersMinQuoted(tconf.Schemas, ", ")
+	setSchemaQuery := fmt.Sprintf("SET SEARCH_PATH TO %s", setSchemas)
 	_, err := conn.Exec(context.Background(), setSchemaQuery)
 	if err != nil {
 		utils.ErrExit("run query: %q on target %q: %s", setSchemaQuery, tconf.Host, err)

@@ -22,9 +22,8 @@ import (
 	"strings"
 	"time"
 
-	goerrors "github.com/go-errors/errors"
-
 	"github.com/fatih/color"
+	goerrors "github.com/go-errors/errors"
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
 
@@ -103,8 +102,10 @@ func (m *MonitorTargetYBHealth) StartMonitoring() error {
 	}
 
 	ybServers := lo.Keys(m.nodesStatus)
-	addresses := strings.Join(ybServers, ":7100,")
-
+	for i, server := range ybServers {
+		ybServers[i] = server + ":7100"
+	}
+	addresses := strings.Join(ybServers, ",")
 	m.ybClient.SetYBServers(addresses)
 
 	for {

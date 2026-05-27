@@ -25,9 +25,8 @@ import (
 	"strings"
 	"time"
 
-	goerrors "github.com/go-errors/errors"
-
 	"github.com/fatih/color"
+	goerrors "github.com/go-errors/errors"
 	"github.com/gosuri/uilive"
 	"github.com/magiconair/properties"
 	"github.com/samber/lo"
@@ -117,6 +116,10 @@ func prepareDebeziumConfig(partitionsToRootTableMap map[string]string, tableList
 		return fmt.Sprintf("%s:%s", k, v)
 	}), ",")
 
+	partitionToRootMapping := strings.Join(lo.MapToSlice(partitionsToRootTableMap, func(k, v string) string {
+		return fmt.Sprintf("%s:%s", k, v)
+	}), ",")
+
 	dbzmLogLevel := config.LogLevel
 	if config.IsLogLevelErrorOrAbove() {
 		// dbzm does not support fatal/panic log levels
@@ -136,12 +139,13 @@ func prepareDebeziumConfig(partitionsToRootTableMap map[string]string, tableList
 		Username:           source.User,
 		Password:           source.Password,
 
-		DatabaseName:          source.DBName,
-		SchemaNames:           source.Schema,
-		TableList:             dbzmTableList,
-		ColumnList:            dbzmColumnList,
-		ColumnSequenceMapping: columnSequenceMapping,
-		TableRenameMapping:    tableRenameMapping,
+		DatabaseName:           source.DBName,
+		SchemaNames:            sqlname.JoinIdentifiersUnquoted(source.Schemas, "|"),
+		TableList:              dbzmTableList,
+		ColumnList:             dbzmColumnList,
+		ColumnSequenceMapping:  columnSequenceMapping,
+		TableRenameMapping:     tableRenameMapping,
+		PartitionToRootMapping: partitionToRootMapping,
 
 		SSLMode:               source.SSLMode,
 		SSLCertPath:           source.SSLCertPath,
@@ -267,10 +271,16 @@ func fetchOrRetrieveColToSeqMap(msr *metadb.MigrationStatusRecord, tableList []s
 	return colToSeqMap, nil
 }
 
+// returns qualified column name to sequence name mapping for debezium
+// <schema>.<table>.<column>:<sequnce_name_user_query_format> as the sequence max value mapping also has the userQuery format
 func getColumnToSequenceMapping(colToSeqMap map[string]string) (string, error) {
 	var colToSeqMapSlices []string
 
 	for k, v := range colToSeqMap {
+		seqTuple, err := namereg.NameReg.LookupTableName(v)
+		if err != nil {
+			return "", goerrors.Errorf("lookup failed for sequence %s", v)
+		}
 		parts := strings.Split(k, ".")
 		leafTable := fmt.Sprintf("%s.%s", parts[0], parts[1])
 		rootTable, isRenamed := renameTableIfRequired(leafTable)
@@ -279,12 +289,12 @@ func getColumnToSequenceMapping(colToSeqMap map[string]string) (string, error) {
 			if err != nil {
 				return "", goerrors.Errorf("lookup failed for table %s", rootTable)
 			}
-			c := fmt.Sprintf("%s.%s:%s", rootTableTup.AsQualifiedCatalogName(), parts[2], v)
+			c := fmt.Sprintf("%s.%s:%s", rootTableTup.AsQualifiedCatalogName(), parts[2], seqTuple.ForKey())
 			if !slices.Contains(colToSeqMapSlices, c) {
 				colToSeqMapSlices = append(colToSeqMapSlices, c)
 			}
 		} else {
-			colToSeqMapSlices = append(colToSeqMapSlices, fmt.Sprintf("%s:%s", k, v))
+			colToSeqMapSlices = append(colToSeqMapSlices, fmt.Sprintf("%s:%s", k, seqTuple.ForKey()))
 		}
 	}
 
@@ -366,8 +376,26 @@ func isOracleJDBCWalletLocationSet(s srcdb.Source) (bool, error) {
 
 // ---------------------------------------------- Export Data ---------------------------------------//
 
-func debeziumExportData(ctx context.Context, config *dbzm.Config, tableNameToApproxRowCountMap map[string]int64) error {
+func isCutoverInitiatedAndCutoverDetected(exporterRole string) (bool, error) {
+	msr, err := metaDB.GetMigrationStatusRecord()
+	if err != nil {
+		return false, fmt.Errorf("failed to get migration status record: %w", err)
+	}
 
+	switch exporterRole {
+	case TARGET_DB_EXPORTER_FB_ROLE:
+		return msr.CutoverDetectedByTargetFBExporter, nil
+	case TARGET_DB_EXPORTER_FF_ROLE:
+		return msr.CutoverDetectedByTargetFFExporter, nil
+	case SOURCE_DB_EXPORTER_ROLE:
+		return msr.CutoverDetectedBySourceExporter, nil
+	}
+	return false, nil
+}
+
+func debeziumExportData(config *dbzm.Config, tableNameToApproxRowCountMap map[string]int64) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	if config.SnapshotMode != "never" {
 		err := metaDB.UpdateMigrationStatusRecord(func(record *metadb.MigrationStatusRecord) {
 			record.SnapshotMechanism = "debezium"
@@ -408,7 +436,7 @@ func debeziumExportData(ctx context.Context, config *dbzm.Config, tableNameToApp
 		}
 		progressTracker.UpdateProgress(status)
 		if !snapshotComplete {
-			snapshotComplete, err = checkAndHandleSnapshotComplete(config, status, progressTracker)
+			snapshotComplete, err = checkAndHandleSnapshotComplete(config, status, progressTracker, ctx)
 			if err != nil {
 				return fmt.Errorf("failed to check if snapshot is complete: %w", err)
 			}
@@ -425,7 +453,7 @@ func debeziumExportData(ctx context.Context, config *dbzm.Config, tableNameToApp
 		if err != nil {
 			return fmt.Errorf("failed to read export status: %w", err)
 		}
-		snapshotComplete, err = checkAndHandleSnapshotComplete(config, status, progressTracker)
+		snapshotComplete, err = checkAndHandleSnapshotComplete(config, status, progressTracker, ctx)
 		if !snapshotComplete || err != nil {
 			return fmt.Errorf("snapshot was not completed: %w", err)
 		}
@@ -435,7 +463,7 @@ func debeziumExportData(ctx context.Context, config *dbzm.Config, tableNameToApp
 	return nil
 }
 
-func reportStreamingProgress() {
+func reportStreamingProgress(ctx context.Context) {
 	tableWriter := uilive.New()
 	headerWriter := tableWriter.Newline()
 	separatorWriter := tableWriter.Newline()
@@ -455,11 +483,16 @@ func reportStreamingProgress() {
 		fmt.Fprint(row4Writer, color.GreenString("| %-40s | %30s |\n", "Export Rate(Last 10 min)", strconv.FormatInt(throughputInLast10Min, 10)+"/sec"))
 		fmt.Fprint(footerWriter, color.GreenString("| %-40s | %30s |\n", "---------------------------------------", "-----------------------------"))
 		tableWriter.Flush()
-		time.Sleep(10 * time.Second)
+		select {
+		case <-ctx.Done():
+			tableWriter.Stop()
+			return
+		case <-time.After(10 * time.Second):
+		}
 	}
 }
 
-func calculateStreamingProgress() {
+func calculateStreamingProgress(ctx context.Context) {
 	var err error
 	for {
 		totalEventCount, totalEventCountRun, err = metaDB.GetTotalExportedEventsByExporterRole(exporterRole, runId)
@@ -475,19 +508,27 @@ func calculateStreamingProgress() {
 		if err != nil {
 			utils.ErrExit("failed to get export rate from metadb: %w", err)
 		}
-		if disablePb && callhome.SendDiagnostics {
-			// to not do unneccessary frequent calls to metadb in case we only require this info for callhome
-			time.Sleep(12 * time.Minute)
-		} else {
-			time.Sleep(10 * time.Second)
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			if disablePb && callhome.SendDiagnostics {
+				// to not do unneccessary frequent calls to metadb in case we only require this info for callhome
+				time.Sleep(12 * time.Minute)
+			} else {
+				time.Sleep(10 * time.Second)
+			}
 		}
 	}
 
 }
 
-func checkAndHandleSnapshotComplete(config *dbzm.Config, status *dbzm.ExportStatus, progressTracker *ProgressTracker) (bool, error) {
+func checkAndHandleSnapshotComplete(config *dbzm.Config, status *dbzm.ExportStatus, progressTracker *ProgressTracker, ctx context.Context) (bool, error) {
 	if !status.SnapshotExportIsComplete() {
 		return false, nil
+	}
+	if triggered, fpErr := injectSnapshotToCDCTransitionError(); triggered {
+		return false, fpErr
 	}
 	exportPhase = dbzm.MODE_STREAMING
 	if config.SnapshotMode != "never" {
@@ -522,6 +563,10 @@ func checkAndHandleSnapshotComplete(config *dbzm.Config, status *dbzm.ExportStat
 					}
 				}
 
+				if triggered, fpErr := injectExportFromTargetStartupError(); triggered {
+					return false, fpErr
+				}
+
 				err = metaDB.UpdateMigrationStatusRecord(func(record *metadb.MigrationStatusRecord) {
 					if exporterRole == TARGET_DB_EXPORTER_FB_ROLE {
 						record.ExportFromTargetFallBackStarted = true
@@ -536,14 +581,22 @@ func checkAndHandleSnapshotComplete(config *dbzm.Config, status *dbzm.ExportStat
 					utils.ErrExit("failed to update migration status record for export data from target start: %w", err)
 				}
 			}
+		} else if exporterRole == SOURCE_DB_EXPORTER_ROLE {
+
+			err := metaDB.UpdateMigrationStatusRecord(func(record *metadb.MigrationStatusRecord) {
+				record.ExportDataFromSourceStarted = true
+			})
+			if err != nil {
+				utils.ErrExit("failed to update migration status record: %w", err)
+			}
 		}
 
-		color.Blue("streaming changes to a local queue file...")
+		utils.PrintAndLogfInfo("streaming changes to a local queue file...")
 		if !disablePb || callhome.SendDiagnostics {
-			go calculateStreamingProgress()
+			go calculateStreamingProgress(ctx)
 		}
 		if !disablePb {
-			go reportStreamingProgress()
+			go reportStreamingProgress(ctx)
 		}
 	}
 	return true, nil

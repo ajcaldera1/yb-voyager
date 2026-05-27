@@ -18,15 +18,12 @@ package cmd
 import (
 	"fmt"
 	"os"
-	"os/exec"
-	"strconv"
 	"strings"
 
 	goerrors "github.com/go-errors/errors"
 	"github.com/spf13/cobra"
 	"golang.org/x/exp/slices"
 
-	"github.com/yugabyte/yb-voyager/yb-voyager/src/dbzm"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/metadb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/srcdb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
@@ -35,8 +32,6 @@ import (
 // source struct will be populated by CLI arguments parsing
 var source srcdb.Source
 
-const MIN_REQUIRED_JAVA_VERSION = 17
-
 // to disable progress bar during data export and import
 var disablePb utils.BoolStr
 var exportType string
@@ -44,7 +39,6 @@ var useDebezium bool
 var runId string
 var excludeTableListFilePath string
 var tableListFilePath string
-var pgExportCommands = []string{"pg_dump", "pg_restore", "psql"}
 
 var exportCmd = &cobra.Command{
 	Use:   "export",
@@ -84,7 +78,7 @@ func registerCommonSourceDBConnFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&source.DBName, "source-db-name", "",
 		"source database name to be migrated to YugabyteDB")
 
-	cmd.Flags().StringVar(&source.Schema, "source-db-schema", "",
+	cmd.Flags().StringVar(&source.SchemaConfig, "source-db-schema", "",
 		"source schema name to export (valid for Oracle, PostgreSQL)\n"+
 			`Note: in case of PostgreSQL, it can be a single or comma separated list of schemas: "schema1,schema2,schema3"`)
 }
@@ -253,6 +247,7 @@ func registerExportDataFlags(cmd *cobra.Command) {
 
 	BoolVar(cmd.Flags(), &source.AllowOracleClobDataExport, "allow-oracle-clob-data-export", false,
 		"[EXPERIMENTAL][Oracle only] Allow exporting data of CLOB columns in offline migration.")
+
 }
 
 func validateSourceDBType() {
@@ -276,21 +271,25 @@ func validateConflictsBetweenTableListFlags(tableList string, excludeTableList s
 }
 
 func validateSourceSchema() {
-	if source.Schema == "" {
+	if source.SchemaConfig == "" {
 		return
 	}
 
-	schemaList := utils.CsvStringToSlice(source.Schema)
+	schemaList := utils.CsvStringToSlice(source.SchemaConfig)
 	switch source.DBType {
 	case MYSQL:
 		utils.ErrExit("Error --source-db-schema flag is not valid for 'MySQL' db type")
 	case ORACLE:
-		if len(schemaList) > 1 {
-			utils.ErrExit("Error single schema at a time is allowed to export from oracle. List of schemas provided: %s", schemaList)
+		if len(schemaList) == 0 {
+			utils.ErrExit("Error --source-db-schema flag is required for 'Oracle' db type")
 		}
+		if len(schemaList) > 1 {
+			utils.ErrExit("Error only single schema at a time is allowed to export from oracle. List of schemas provided: %s", schemaList)
+		}
+		source.SchemaConfig = schemaList[0]
 	case POSTGRESQL:
 		// In PG, its supported to export more than one schema
-		source.Schema = strings.Join(schemaList, "|") // clean and correct formatted for pg
+		source.SchemaConfig = strings.Join(schemaList, ",") // this is just to cleanup the user input witht trimming
 	}
 }
 
@@ -313,11 +312,6 @@ func validateSSLMode() {
 func validateOracleParams() {
 	if source.DBType != ORACLE {
 		return
-	}
-
-	// in oracle, object names are stored in UPPER CASE by default(case insensitive)
-	if !utils.IsQuotedString(source.Schema) {
-		source.Schema = strings.ToUpper(source.Schema)
 	}
 	if source.DBName == "" && source.DBSid == "" && source.TNSAlias == "" {
 		utils.ErrExit(`Error one flag required out of "oracle-tns-alias", "source-db-name", "oracle-db-sid" required.`)
@@ -387,143 +381,27 @@ func validateExportTypeFlag() {
 	if !slices.Contains(validExportTypes, exportType) {
 		utils.ErrExit("Error Invalid export-type: %q. Supported export types are: %s", exportType, validExportTypes)
 	}
+	if exportType != CHANGES_ONLY {
+		return
+	}
+	if exporterRole == SOURCE_DB_EXPORTER_ROLE && source.DBType != POSTGRESQL {
+		utils.ErrExit("Error --export-type 'changes-only' is not supported for %s", source.DBType)
+	} else if bool(startClean) {
+		utils.ErrExit("start-clean flag is not supported for changes-only export type")
+	}
+
 }
 
 func saveExportTypeInMSR() {
 	err := metaDB.UpdateMigrationStatusRecord(func(record *metadb.MigrationStatusRecord) {
-		record.ExportType = exportType
+		if exporterRole == SOURCE_DB_EXPORTER_ROLE {
+			if record.ExportTypeFromSource != "" && record.ExportTypeFromSource != exportType {
+				utils.ErrExit("Error export type from source is already set to '%s'. Cannot override it with '%s'. Use start-clean flag to use the new export type.", record.ExportTypeFromSource, exportType)
+			}
+			record.ExportTypeFromSource = exportType
+		}
 	})
 	if err != nil {
 		utils.ErrExit("error while updating export type in meta db: %v", err)
 	}
-}
-
-func checkDependenciesForExport() (binaryCheckIssues []string, err error) {
-	var missingTools []string
-	switch source.DBType {
-	case POSTGRESQL:
-		sourceDBVersion := source.DB().GetVersion()
-		for _, binary := range pgExportCommands {
-			_, binaryCheckIssue, err := srcdb.GetAbsPathOfPGCommandAboveVersion(binary, sourceDBVersion)
-			if err != nil {
-				return nil, err
-			} else if binaryCheckIssue != "" {
-				binaryCheckIssues = append(binaryCheckIssues, binaryCheckIssue)
-			}
-		}
-
-		missingTools = utils.CheckTools("strings")
-
-	case MYSQL:
-		// In case if it is not a live migration, then we need to check for ora2pg
-		if !(changeStreamingIsEnabled(exportType) || useDebezium) {
-			missingTools = utils.CheckTools("ora2pg")
-		}
-
-	case ORACLE:
-		// In case if it is not a live migration, then we need to check for ora2pg
-		if !(changeStreamingIsEnabled(exportType) || useDebezium) {
-			missingTools = utils.CheckTools("ora2pg", "sqlplus")
-		} else {
-			missingTools = utils.CheckTools("sqlplus")
-		}
-
-	case YUGABYTEDB:
-		missingTools = utils.CheckTools("strings")
-
-	default:
-		return nil, goerrors.Errorf("unknown source database type %q", source.DBType)
-	}
-
-	binaryCheckIssues = append(binaryCheckIssues, missingTools...)
-
-	if changeStreamingIsEnabled(exportType) || useDebezium {
-		// Check for java
-		javaIssue, err := checkJavaVersion()
-		if err != nil {
-			return nil, err
-		}
-		if javaIssue != "" {
-			binaryCheckIssues = append(binaryCheckIssues, javaIssue)
-		}
-	}
-
-	if len(binaryCheckIssues) > 0 {
-		binaryCheckIssues = append(binaryCheckIssues, "Install or Add the required dependencies to PATH and try again")
-	}
-
-	if changeStreamingIsEnabled(exportType) || useDebezium {
-		// Check for debezium
-		// FindDebeziumDistribution returns an error only if the debezium distribution is not found
-		// So its error mesage will be added to problems
-		err = dbzm.FindDebeziumDistribution(source.DBType, false)
-		if err != nil {
-			if len(binaryCheckIssues) > 0 {
-				binaryCheckIssues = append(binaryCheckIssues, "")
-			}
-			binaryCheckIssues = append(binaryCheckIssues, strings.ToUpper(err.Error()[:1])+err.Error()[1:])
-			binaryCheckIssues = append(binaryCheckIssues, "Please check your Voyager installation and try again")
-		}
-	}
-
-	return binaryCheckIssues, nil
-}
-
-func checkJavaVersion() (binaryCheckIssue string, err error) {
-	javaBinary := "java"
-	if javaHome := os.Getenv("JAVA_HOME"); javaHome != "" {
-		javaBinary = javaHome + "/bin/java"
-	}
-
-	// Execute `java -version` to get the version
-	cmd := exec.Command(javaBinary, "-version")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Sprintf("java: required version >= %d", MIN_REQUIRED_JAVA_VERSION), nil
-	}
-
-	// Example output
-	// java version "11.0.16" 2022-07-19 LTS
-	// Java(TM) SE Runtime Environment (build 11.0.16+8-LTS-211)
-	// Java HotSpot(TM) 64-Bit Server VM (build 11.0.16+8-LTS-211, mixed mode, sharing)
-
-	// Convert output to string
-	versionOutput := string(output)
-
-	// Extract the line with the version
-	var versionLine string
-	lines := strings.Split(versionOutput, "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "version") {
-			versionLine = line
-			break
-		}
-	}
-	if versionLine == "" {
-		return "", goerrors.Errorf("unable to find java version in output: %s", versionOutput)
-	}
-
-	// Extract version string from the line (mimics awk -F '"' '/version/ {print $2}')
-	startIndex := strings.Index(versionLine, "\"")
-	endIndex := strings.LastIndex(versionLine, "\"")
-	if startIndex == -1 || endIndex == -1 || startIndex >= endIndex {
-		return "", goerrors.Errorf("unexpected java version output: %s", versionOutput)
-	}
-	version := versionLine[startIndex+1 : endIndex]
-
-	// Extract major version
-	versionNumbers := strings.Split(version, ".")
-	if len(versionNumbers) < 1 {
-		return "", goerrors.Errorf("unexpected java version output: %s", versionOutput)
-	}
-	majorVersion, err := strconv.Atoi(versionNumbers[0])
-	if err != nil {
-		return "", goerrors.Errorf("unexpected java version output: %s", versionOutput)
-	}
-
-	if majorVersion < MIN_REQUIRED_JAVA_VERSION {
-		return fmt.Sprintf("java: required version >= %d; current version: %s", MIN_REQUIRED_JAVA_VERSION, version), nil
-	}
-
-	return "", nil
 }

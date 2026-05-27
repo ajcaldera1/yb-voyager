@@ -20,21 +20,23 @@ import (
 	"strings"
 
 	goerrors "github.com/go-errors/errors"
-
 	"github.com/samber/lo"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"golang.org/x/exp/slices"
 
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/constants"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/metadb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/tgtdb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
 )
 
+var targetDBPassword string
 var sourceDBType string
 var enableOrafce utils.BoolStr
 var importType string
 var prometheusMetricsPort int
+var importUsePartitionRoot utils.BoolStr // default is true for backward compatibility
 
 var supportedSSLModesOnTargetForImport = AllSSLModes // supported SSL modes for YugabyteDB is different for import VS export data from target(streaming phase)
 var supportedSSLModesOnSourceOrSourceReplica = AllSSLModes
@@ -117,6 +119,36 @@ func validateImportDataFlags() error {
 	return nil
 }
 
+func validateImportUsePartitionRootFlag() error {
+	// --use-partition-root flag is only valid for live migration with PostgreSQL or YugabyteDB source
+	//and only for the CDC streaming phase and snapshot part isn't supported right now.
+	if !importUsePartitionRoot {
+		// Only validate when flag is explicitly set to false (non-default)
+		// Read the export type from MSR since importType may not be set yet in PreRun
+		msr, err := metaDB.GetMigrationStatusRecord()
+		if err != nil {
+			return goerrors.Errorf("failed to get migration status record: %w", err)
+		}
+		exportTypeFromSource := msr.ExportTypeFromSource
+		if !changeStreamingIsEnabled(exportTypeFromSource) {
+			return goerrors.Errorf("'--use-partition-root false' is only valid for live migration")
+		}
+		if importerRole == SOURCE_REPLICA_DB_IMPORTER_ROLE {
+			return goerrors.Errorf("'--use-partition-root false' is not supported for source-replica")
+		}
+		if tconf.TargetDBType != POSTGRESQL && tconf.TargetDBType != YUGABYTEDB {
+			return goerrors.Errorf("'--use-partition-root' flag is only valid for PostgreSQL to YugabyteDB migrations")
+		}
+	}
+	tconf.UsePartitionRoot = bool(importUsePartitionRoot)
+	if importerRole != TARGET_DB_IMPORTER_ROLE {
+		return nil
+	}
+	return metaDB.UpdateImportDataStatusRecord(func(record *metadb.ImportDataStatusRecord) {
+		record.TargetUsePartitionRoot = bool(importUsePartitionRoot)
+	})
+}
+
 var validCdcPartitioningStrategies = []string{"pk", "table", "auto"}
 
 func validateCdcPartitioningStrategyFlag(cmd *cobra.Command) error {
@@ -183,7 +215,7 @@ func registerTargetDBConnFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&tconf.DBName, "target-db-name", "",
 		"name of the database on the target YugabyteDB server on which import needs to be done")
 
-	cmd.Flags().StringVar(&tconf.Schema, "target-db-schema", "",
+	cmd.Flags().StringVar(&tconf.SchemaConfig, "target-db-schema", "",
 		"target schema name in YugabyteDB (Note: works only for source as Oracle and MySQL, in case of PostgreSQL you can ALTER schema name post import)")
 
 	// TODO: SSL related more args might come. Need to explore SSL part completely.
@@ -235,7 +267,7 @@ func registerSourceReplicaDBAsTargetConnFlags(cmd *cobra.Command) {
 	cmd.Flags().StringVar(&tconf.TNSAlias, "oracle-tns-alias", "",
 		"[For Oracle Only] Name of TNS Alias you wish to use to connect to Oracle instance. Refer to documentation to learn more about configuring tnsnames.ora and aliases")
 
-	cmd.Flags().StringVar(&tconf.Schema, "source-replica-db-schema", "",
+	cmd.Flags().StringVar(&tconf.SchemaConfig, "source-replica-db-schema", "",
 		"schema name in Source-Replica DB (Note: works only for source as Oracle, in case of PostgreSQL schemas remain same as of source)")
 
 	// TODO: SSL related more args might come. Need to explore SSL part completely.
@@ -297,6 +329,20 @@ func registerImportDataCommonFlags(cmd *cobra.Command) {
 	BoolVar(cmd.Flags(), &truncateSplits, "truncate-splits", true,
 		"Truncate splits after importing")
 	cmd.Flags().MarkHidden("truncate-splits")
+}
+
+func registerImportUsePartitionRootFlagToTarget(cmd *cobra.Command) {
+	BoolVar(cmd.Flags(), &importUsePartitionRoot, "use-partition-root", true,
+		"For partitioned tables during live migration:\n"+
+			"  - true (default): Import CDC data only via the root table.\n"+
+			"  - false: Import CDC data only via child partitions\n(Note: this flag is only supported for YugabyteDB target version 2025.2.3.0 and above)")
+}
+
+func registerImportUsePartitionRootFlagToSource(cmd *cobra.Command) {
+	BoolVar(cmd.Flags(), &importUsePartitionRoot, "use-partition-root", true,
+		"For partitioned tables during live migration:\n"+
+			"  - true (default): Import CDC data only via the root table.\n"+
+			"  - false: Import CDC data only via child partitions\n")
 }
 
 func registerImportDataToTargetFlags(cmd *cobra.Command) {
@@ -380,18 +426,23 @@ func validateTargetSchemaFlag() {
 	// This is not applicable for import-data-to-source-replica (validateFFDBSchemaFlag)/import-data-to-source (no ability to pass schema).
 	// For import-data-file, we allow this flag and source is PG(dummy)
 	if !slices.Contains([]string{SOURCE_REPLICA_DB_IMPORTER_ROLE, SOURCE_DB_IMPORTER_ROLE, IMPORT_FILE_ROLE}, importerRole) {
-		if tconf.Schema != "" && sourceDBType == "postgresql" {
+		if tconf.SchemaConfig != "" && sourceDBType == "postgresql" {
 			utils.ErrExit("Error --target-db-schema flag is not valid for export from 'postgresql' db type")
 		}
 	}
 
-	if tconf.Schema == "" {
+	if tconf.SchemaConfig == "" {
 		if tconf.TargetDBType == YUGABYTEDB {
-			tconf.Schema = YUGABYTEDB_DEFAULT_SCHEMA
+			tconf.SchemaConfig = YUGABYTEDB_DEFAULT_SCHEMA
 		} else if tconf.TargetDBType == ORACLE {
-			tconf.Schema = tconf.User
+			tconf.SchemaConfig = tconf.User
 		}
 		return
+	} else if tconf.TargetDBType != POSTGRESQL {
+		splits := strings.Split(tconf.SchemaConfig, ",")
+		if len(splits) > 1 {
+			utils.ErrExit("Error --target-db-schema flag can only contain one schema name. Got: %s", tconf.SchemaConfig)
+		}
 	}
 }
 
@@ -457,9 +508,9 @@ func registerFlagsForTarget(cmd *cobra.Command) {
 	cmd.Flags().Int64Var(&batchSizeInNumRows, "batch-size", 0,
 		fmt.Sprintf("Size of batches in the number of rows generated for ingestion during import. default(%d)", DEFAULT_BATCH_SIZE_YUGABYTEDB))
 	cmd.Flags().IntVar(&tconf.Parallelism, "parallel-jobs", 0,
-		"number of parallel jobs to use while importing data. By default, voyager will try if it can determine the total "+
-			"number of cores N and use N/4 as parallel jobs. "+
-			"Otherwise, it fall back to using twice the number of nodes in the cluster. "+
+		"number of parallel jobs to use while importing data. By default, voyager will try to determine the total "+
+			"number of cores N across the cluster and use N/4 as parallel jobs. "+
+			"If core detection fails, it estimates N using the number of nodes * 16 assumed vCPUs per node. "+
 			"Any value less than 1 reverts to the default calculation.")
 
 	cmd.Flags().Var(&tconf.AdaptiveParallelismMode, "adaptive-parallelism",
@@ -473,7 +524,7 @@ func registerFlagsForTarget(cmd *cobra.Command) {
 
 	cmd.Flags().IntVar(&tconf.MaxParallelism, "adaptive-parallelism-max", 0,
 		"number of max parallel jobs to use while importing data when adaptive parallelism is enabled. "+
-			"By default, voyager will try if it can determine the total number of cores N and use N/2 as the max parallel jobs.")
+			"By default, voyager will try to determine the total number of cores N and use N as the max parallel jobs.")
 	BoolVar(cmd.Flags(), &skipReplicationChecks, "skip-replication-checks", false,
 		"It is NOT recommended to have any form of replication (CDC/xCluster) running on the target YugabyteDB cluster during data import. "+
 			"If detected, data import is aborted. Use this flag to turn off the checks and continue importing data.")
@@ -531,7 +582,7 @@ func validateBatchSizeFlag(numLinesInASplit int64) {
 }
 
 func validateFFDBSchemaFlag() {
-	if tconf.Schema == "" && tconf.TargetDBType == ORACLE {
+	if tconf.SchemaConfig == "" && tconf.TargetDBType == ORACLE {
 		utils.ErrExit("Error --source-replica-db-schema flag is mandatory for import data to source-replica")
 	}
 }
