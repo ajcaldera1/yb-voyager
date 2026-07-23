@@ -50,9 +50,15 @@ var FLUSH_BATCH_EVENT = &tgtdb.Event{Op: "flush_batch"}
 var eventQueue *EventQueue
 var statsReporter *reporter.StreamImportStatsReporter
 
+// Tablet-affine CDC apply (tablet partitioning strategy). These are nil unless at
+// least one table resolves to the tablet strategy on a YugabyteDB target.
+var tabletRouter *TabletRouter
+var tabletWorkerRegistry *TabletWorkerRegistry
+
 const (
-	PARTITION_BY_PK    = "pk"
-	PARTITION_BY_TABLE = "table"
+	PARTITION_BY_PK     = "pk"
+	PARTITION_BY_TABLE  = "table"
+	PARTITION_BY_TABLET = "tablet"
 )
 
 func init() {
@@ -121,9 +127,24 @@ func streamChanges(state *ImportDataState, tableNames []sqlname.NameTuple) error
 		return fmt.Errorf("failed to initialize stats reporter: %w", err)
 	}
 
-	tableToPartitioningStrategyMap, err := getCdcPartitioningStrategyPerTable(tableNames)
+	// Create the tablet router up-front so the strategy resolver can evaluate
+	// per-table eligibility (and register eligible tables) for tablet/auto strategies.
+	tabletRouter = maybeCreateTabletRouter()
+
+	tableToPartitioningStrategyMap, err := getCdcPartitioningStrategyPerTable(tableNames, tabletRouter)
 	if err != nil {
 		return fmt.Errorf("error handling cdc partitioning strategy: %w", err)
+	}
+
+	// If any table resolved to the tablet strategy, spin up the tablet worker registry
+	// and a background loop that re-polls tablet metadata to remap workers on splits.
+	if anyTableUsesTabletStrategy(tableToPartitioningStrategyMap) {
+		tabletWorkerRegistry = NewTabletWorkerRegistry(state, statsReporter, EVENT_CHANNEL_SIZE)
+		refreshCtx, cancelRefresh := context.WithCancel(context.Background())
+		defer cancelRefresh()
+		go startTabletMetadataRefreshLoop(refreshCtx, tabletRouter, tabletWorkerRegistry, tabletMetadataRefreshInterval, tableToPartitioningStrategyMap)
+		defer tabletWorkerRegistry.CloseAll()
+		log.Infof("tablet-affine CDC apply enabled; tablet metadata refresh interval: %s", tabletMetadataRefreshInterval)
 	}
 
 	if !disablePb {
@@ -174,7 +195,7 @@ the CDC Partitioning strategy can be overriden by flag --cdc-partitioning-strate
 
 TODO: handle upgrade scenario for PG/Oracle pk->table change
 */
-func getCdcPartitioningStrategyPerTable(tableNames []sqlname.NameTuple) (*utils.StructMap[sqlname.NameTuple, string], error) {
+func getCdcPartitioningStrategyPerTable(tableNames []sqlname.NameTuple, router *TabletRouter) (*utils.StructMap[sqlname.NameTuple, string], error) {
 	tableToPartitioningStrategyMap := utils.NewStructMap[sqlname.NameTuple, string]()
 
 	if importerRole != TARGET_DB_IMPORTER_ROLE {
@@ -212,6 +233,10 @@ func getCdcPartitioningStrategyPerTable(tableNames []sqlname.NameTuple) (*utils.
 				return nil, goerrors.Errorf("cdc partitioning strategy not found for table: %s", t.ForKey())
 			}
 		}
+		// Re-register any tablet-strategy tables with the router so runtime routing works on resume.
+		if err := registerTabletTablesFromStrategyMap(tableToPartitioningStrategyMap, router); err != nil {
+			return nil, err
+		}
 		return tableToPartitioningStrategyMap, nil
 	}
 
@@ -227,8 +252,28 @@ func getCdcPartitioningStrategyPerTable(tableNames []sqlname.NameTuple) (*utils.
 
 		for _, t := range tableNames {
 			if lo.Contains(expressionUniqueIndexTables, t) {
+				// Expression/normal unique indexes force sequential per-table apply.
 				tableToPartitioningStrategyMap.Put(t, PARTITION_BY_TABLE)
+			} else if tabletEligible(router, t) {
+				// auto picks tablet-affine apply when the table is eligible on YB.
+				tableToPartitioningStrategyMap.Put(t, PARTITION_BY_TABLET)
 			} else {
+				tableToPartitioningStrategyMap.Put(t, PARTITION_BY_PK)
+			}
+		}
+	case PARTITION_BY_TABLET:
+		//explicit tablet strategy: eligible tables use tablet-affine apply; others fall back.
+		expressionUniqueIndexTables, err := getExpressionUniqueIndexTables(tableNames)
+		if err != nil {
+			return nil, fmt.Errorf("error getting expression unique index tables: %w", err)
+		}
+		for _, t := range tableNames {
+			if lo.Contains(expressionUniqueIndexTables, t) {
+				tableToPartitioningStrategyMap.Put(t, PARTITION_BY_TABLE)
+			} else if tabletEligible(router, t) {
+				tableToPartitioningStrategyMap.Put(t, PARTITION_BY_TABLET)
+			} else {
+				// Ineligible (colocated / range-sharded / no yb_tablet_metadata) -> pk.
 				tableToPartitioningStrategyMap.Put(t, PARTITION_BY_PK)
 			}
 		}
@@ -254,6 +299,89 @@ func getCdcPartitioningStrategyPerTable(tableNames []sqlname.NameTuple) (*utils.
 	}
 	log.Infof("updated cdc partitioning strategy in metadb: %v", metadb.IMPORT_DATA_STATUS_KEY)
 	return tableToPartitioningStrategyMap, nil
+}
+
+// maybeCreateTabletRouter returns a TabletRouter when tablet-affine apply is
+// applicable: target importer, YugabyteDB target exposing yb_tablet_metadata, and a
+// strategy that can select tablet (auto or tablet). Returns nil otherwise.
+func maybeCreateTabletRouter() *TabletRouter {
+	if importerRole != TARGET_DB_IMPORTER_ROLE {
+		return nil
+	}
+	if cdcPartitioningStrategy != "auto" && cdcPartitioningStrategy != PARTITION_BY_TABLET {
+		return nil
+	}
+	yb, ok := tdb.(*tgtdb.TargetYugabyteDB)
+	if !ok {
+		if cdcPartitioningStrategy == PARTITION_BY_TABLET {
+			log.Warnf("tablet cdc-partitioning-strategy requested but target is not YugabyteDB; falling back to pk")
+		}
+		return nil
+	}
+	if !yb.IsTabletMetadataSupported() {
+		if cdcPartitioningStrategy == PARTITION_BY_TABLET {
+			log.Warnf("tablet cdc-partitioning-strategy requested but target does not expose yb_tablet_metadata; falling back to pk")
+		}
+		return nil
+	}
+	return NewTabletRouter(yb)
+}
+
+func anyTableUsesTabletStrategy(strategyMap *utils.StructMap[sqlname.NameTuple, string]) bool {
+	found := false
+	strategyMap.IterKV(func(_ sqlname.NameTuple, strategy string) (bool, error) {
+		if strategy == PARTITION_BY_TABLET {
+			found = true
+			return false, nil
+		}
+		return true, nil
+	})
+	return found
+}
+
+// tabletEligible reports whether a table can use tablet-affine apply and, as a side
+// effect, registers eligible tables with the router for runtime routing.
+func tabletEligible(router *TabletRouter, table sqlname.NameTuple) bool {
+	if router == nil {
+		return false
+	}
+	ok, reason, err := router.AddTable(table)
+	if err != nil {
+		log.Warnf("tablet strategy: error evaluating eligibility for %s (%v); falling back to pk", table.ForKey(), err)
+		return false
+	}
+	if !ok {
+		log.Infof("tablet strategy: table %s not eligible (%s); falling back to pk", table.ForKey(), reason)
+		return false
+	}
+	log.Infof("tablet strategy: table %s is eligible for tablet-affine apply", table.ForKey())
+	return true
+}
+
+// registerTabletTablesFromStrategyMap re-registers tablet-strategy tables with the
+// router on resume (when the strategy was already persisted in metadb).
+func registerTabletTablesFromStrategyMap(strategyMap *utils.StructMap[sqlname.NameTuple, string], router *TabletRouter) error {
+	var regErr error
+	strategyMap.IterKV(func(t sqlname.NameTuple, strategy string) (bool, error) {
+		if strategy != PARTITION_BY_TABLET {
+			return true, nil
+		}
+		if router == nil {
+			regErr = goerrors.Errorf("table %s uses tablet partitioning but the target no longer supports yb_tablet_metadata; use --start-clean to re-import with a supported strategy", t.ForKey())
+			return false, nil
+		}
+		ok, reason, err := router.AddTable(t)
+		if err != nil {
+			regErr = goerrors.Errorf("error registering tablet table %s on resume: %v", t.ForKey(), err)
+			return false, nil
+		}
+		if !ok {
+			regErr = goerrors.Errorf("table %s uses tablet partitioning but is no longer eligible (%s); use --start-clean to re-import", t.ForKey(), reason)
+			return false, nil
+		}
+		return true, nil
+	})
+	return regErr
 }
 
 func getExpressionUniqueIndexTables(tableNames []sqlname.NameTuple) ([]sqlname.NameTuple, error) {
@@ -370,6 +498,12 @@ func streamChangesFromSegment(
 		<-processingDoneChans[i]
 	}
 
+	// Tablet workers persist across segments; drain them (in-flight batches committed)
+	// before marking the segment processed so resume is consistent for tablet tables.
+	if tabletWorkerRegistry != nil {
+		tabletWorkerRegistry.QuiesceAll()
+	}
+
 	err = metaDB.MarkEventQueueSegmentAsProcessed(segment.SegmentNum, importerRole)
 	if err != nil {
 		return goerrors.Errorf("error marking segment %s as processed: %v", segment.FilePath, err)
@@ -412,13 +546,37 @@ func handleEvent(event *tgtdb.Event,
 	}
 	log.Debugf("handling event: %v", event)
 
-	// hash event
-	// Note: hash the event before running the keys/values through the value converter.
+	strategy, ok := tableToPartitioningStrategyMap.Get(event.TableNameTup)
+	if !ok {
+		return goerrors.Errorf("table to partitioning strategy map does not contain table %v", event.TableNameTup)
+	}
+	tabletStrategy := strategy == PARTITION_BY_TABLET
+
+	// For the tablet strategy, hold the routing barrier across route+enqueue so a
+	// concurrent split remap can never interleave between resolving the tablet and
+	// enqueuing the event (which would risk parent/child applying the same key).
+	if tabletStrategy {
+		tabletWorkerRegistry.RoutingBarrierRLock()
+		defer tabletWorkerRegistry.RoutingBarrierRUnlock()
+	}
+
+	// hash event / route to tablet
+	// Note: route the event before running the keys/values through the value converter.
 	// This is because the value converter can generate different values (formatting vs no formatting) for the same key
-	// which will affect hash value.
-	h, err := hashEvent(event, tableToPartitioningStrategyMap)
-	if err != nil {
-		return goerrors.Errorf("error hashing event: %v", err)
+	// which will affect the hash value / tablet assignment.
+	var h int
+	var tabletID string
+	var err error
+	if tabletStrategy {
+		tabletID, err = tabletRouter.RouteEvent(event)
+		if err != nil {
+			return goerrors.Errorf("error routing event to tablet: %v", err)
+		}
+	} else {
+		h, err = hashEvent(event, tableToPartitioningStrategyMap)
+		if err != nil {
+			return goerrors.Errorf("error hashing event: %v", err)
+		}
 	}
 
 	/*
@@ -448,6 +606,14 @@ func handleEvent(event *tgtdb.Event,
 
 	if err := injectImportCDCTransformFailure(); err != nil {
 		return err
+	}
+
+	if tabletStrategy {
+		if err := tabletWorkerRegistry.Enqueue(event.TableNameTup, tabletID, event); err != nil {
+			return goerrors.Errorf("error enqueuing event to tablet worker: %v", err)
+		}
+		log.Tracef("inserted event %v into tablet worker %s", event.Vsn, tabletID)
+		return nil
 	}
 
 	evChans[h] <- event
@@ -532,56 +698,65 @@ func processEvents(chanNo int, evChan chan *tgtdb.Event, lastAppliedVsn int64, d
 			continue
 		}
 
-		start := time.Now()
 		eventBatch := tgtdb.NewEventBatch(batch, chanNo)
-		var err error
-		sleepIntervalSec := 0
-		for attempt := 0; attempt < EVENT_BATCH_MAX_RETRY_COUNT; attempt++ {
-			err = tdb.ExecuteBatch(migrationUUID, eventBatch)
-			if err == nil {
-				if fpErr := injectImportCDCNonRetryableBatchDBError(); fpErr != nil {
-					err = fpErr
-				}
-			}
-			if err == nil {
-				break
-			} else if tdb.IsNonRetryableCopyError(err) {
-				break
-			}
-			log.Warnf("retriable error executing batch(%s) on channel %v (last VSN: %d): %v", eventBatch.ID(), chanNo, eventBatch.GetLastVsn(), err)
-			sleepIntervalSec += 10
-			if sleepIntervalSec > MAX_SLEEP_SECOND {
-				sleepIntervalSec = MAX_SLEEP_SECOND
-			}
-			log.Infof("sleep for %d seconds before retrying the batch on channel %v (attempt %d)",
-				sleepIntervalSec, chanNo, attempt)
-			time.Sleep(time.Duration(sleepIntervalSec) * time.Second)
-
-			// In certain situations, we get an error on `targetDB.ExecuteBatch`, but eventually the transaction is committed.
-			// For example, in Yugabyte, we can get an `rpc timeout` on commit, and the commit eventually succeeds on YB server.
-			// Retrying an already executed batch has consequences:
-			// - It can fail with some duplicate / unique key constraint errors
-			// - Stats will double count the events.
-			// Therefore, we check if batch has already been imported before retrying.
-			alreadyImported, aerr := checkifEventBatchAlreadyImported(state, eventBatch, migrationUUID)
-			if aerr != nil {
-				utils.ErrExit("error checking if event batch channel %d (last VSN: %d) already imported: %v", chanNo, eventBatch.GetLastVsn(), aerr)
-			}
-			if alreadyImported {
-				log.Infof("batch on channel %d (last VSN: %d) already imported", chanNo, eventBatch.GetLastVsn())
-				err = nil
-				break
-			}
-		}
-		if err != nil {
-			utils.ErrExit("error executing batch on channel %v: %v", chanNo, err)
-		}
-		conflictDetectionCache.RemoveEvents(eventBatch.Events...)
-		statsReporter.BatchImported(eventBatch.EventCounts.NumInserts, eventBatch.EventCounts.NumUpdates, eventBatch.EventCounts.NumDeletes)
-		log.Debugf("processEvents from channel %v: Executed Batch of size - %d successfully in time %s",
-			chanNo, len(batch), time.Since(start).String())
+		executeEventBatch(eventBatch, state, statsReporter, fmt.Sprintf("channel %v", chanNo))
 	}
 	done <- true
+}
+
+// executeEventBatch applies an event batch to the target with retries, handling the
+// "committed-but-returned-error" case, conflict-cache cleanup, and stats reporting.
+// It is shared by the fixed-channel processors (pk/table strategy) and the
+// tablet-affine workers (tablet strategy). identity is a human-readable label used
+// only for logging (e.g. "channel 37" or "tablet <id>").
+func executeEventBatch(eventBatch *tgtdb.EventBatch, state *ImportDataState, statsReporter *reporter.StreamImportStatsReporter, identity string) {
+	start := time.Now()
+	var err error
+	sleepIntervalSec := 0
+	for attempt := 0; attempt < EVENT_BATCH_MAX_RETRY_COUNT; attempt++ {
+		err = tdb.ExecuteBatch(migrationUUID, eventBatch)
+		if err == nil {
+			if fpErr := injectImportCDCNonRetryableBatchDBError(); fpErr != nil {
+				err = fpErr
+			}
+		}
+		if err == nil {
+			break
+		} else if tdb.IsNonRetryableCopyError(err) {
+			break
+		}
+		log.Warnf("retriable error executing batch(%s) on %s (last VSN: %d): %v", eventBatch.ID(), identity, eventBatch.GetLastVsn(), err)
+		sleepIntervalSec += 10
+		if sleepIntervalSec > MAX_SLEEP_SECOND {
+			sleepIntervalSec = MAX_SLEEP_SECOND
+		}
+		log.Infof("sleep for %d seconds before retrying the batch on %s (attempt %d)",
+			sleepIntervalSec, identity, attempt)
+		time.Sleep(time.Duration(sleepIntervalSec) * time.Second)
+
+		// In certain situations, we get an error on `targetDB.ExecuteBatch`, but eventually the transaction is committed.
+		// For example, in Yugabyte, we can get an `rpc timeout` on commit, and the commit eventually succeeds on YB server.
+		// Retrying an already executed batch has consequences:
+		// - It can fail with some duplicate / unique key constraint errors
+		// - Stats will double count the events.
+		// Therefore, we check if batch has already been imported before retrying.
+		alreadyImported, aerr := checkifEventBatchAlreadyImported(state, eventBatch, migrationUUID)
+		if aerr != nil {
+			utils.ErrExit("error checking if event batch on %s (last VSN: %d) already imported: %v", identity, eventBatch.GetLastVsn(), aerr)
+		}
+		if alreadyImported {
+			log.Infof("batch on %s (last VSN: %d) already imported", identity, eventBatch.GetLastVsn())
+			err = nil
+			break
+		}
+	}
+	if err != nil {
+		utils.ErrExit("error executing batch on %s: %v", identity, err)
+	}
+	conflictDetectionCache.RemoveEvents(eventBatch.Events...)
+	statsReporter.BatchImported(eventBatch.EventCounts.NumInserts, eventBatch.EventCounts.NumUpdates, eventBatch.EventCounts.NumDeletes)
+	log.Debugf("Executed batch of size - %d on %s successfully in time %s",
+		len(eventBatch.Events), identity, time.Since(start).String())
 }
 
 func initializeConflictDetectionCache(evChans []chan *tgtdb.Event, exporterRole string, sourceDBTypeForConflictCache string) error {
@@ -591,6 +766,9 @@ func initializeConflictDetectionCache(evChans []chan *tgtdb.Event, exporterRole 
 	}
 	log.Infof("initializing conflict detection cache")
 	conflictDetectionCache = NewConflictDetectionCache(tableToUniqueKeyColumns, evChans, sourceDBTypeForConflictCache)
+	if tabletWorkerRegistry != nil {
+		conflictDetectionCache.SetFlushHook(tabletWorkerRegistry.FlushAllWorkers)
+	}
 	return nil
 }
 

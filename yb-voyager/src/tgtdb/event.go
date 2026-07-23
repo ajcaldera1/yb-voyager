@@ -569,9 +569,20 @@ func (ec *EventCounter) Merge(ec2 *EventCounter) {
 
 // ==============================================================================================================================
 
+// TabletWorkerID identifies the tablet-affine worker that produced a batch when
+// the tablet CDC partitioning strategy is in effect. TableName is NameTuple.ForKey().
+type TabletWorkerID struct {
+	TableName string
+	TabletID  string
+}
+
 type EventBatch struct {
-	Events             []*Event
-	ChanNo             int
+	Events []*Event
+	ChanNo int
+	// TabletWorker is non-nil when the batch is produced by a tablet-affine worker.
+	// In that case, watermark/counter bookkeeping uses TABLET_WORKERS_METADATA_TABLE_NAME
+	// instead of the channel/per-table metadata tables.
+	TabletWorker       *TabletWorkerID
 	EventCounts        *EventCounter
 	EventCountsByTable *utils.StructMap[sqlname.NameTuple, *EventCounter]
 }
@@ -585,6 +596,24 @@ func NewEventBatch(events []*Event, chanNo int) *EventBatch {
 	}
 	batch.updateCounts()
 	return batch
+}
+
+// NewTabletEventBatch builds a batch for a tablet-affine worker. All events in the
+// batch belong to the same table and tablet.
+func NewTabletEventBatch(events []*Event, tableName string, tabletID string) *EventBatch {
+	batch := &EventBatch{
+		Events:             events,
+		TabletWorker:       &TabletWorkerID{TableName: tableName, TabletID: tabletID},
+		EventCounts:        &EventCounter{},
+		EventCountsByTable: utils.NewStructMap[sqlname.NameTuple, *EventCounter](),
+	}
+	batch.updateCounts()
+	return batch
+}
+
+// IsTabletBatch reports whether this batch is produced by a tablet-affine worker.
+func (eb *EventBatch) IsTabletBatch() bool {
+	return eb.TabletWorker != nil
 }
 
 func (eb *EventBatch) GetLastVsn() int64 {
@@ -620,6 +649,30 @@ func (eb *EventBatch) GetChannelMetadataUpdateQuery(migrationUUID uuid.UUID) str
 		eb.EventCounts.NumUpdates,
 		eb.EventCounts.NumDeletes,
 		migrationUUID, eb.ChanNo)
+}
+
+// GetTabletWorkerMetadataUpdateQuery returns the query that atomically advances the
+// last_applied_vsn watermark and event counters for this batch's tablet worker.
+// A tablet batch is single-table by construction, so EventCounts covers the batch.
+func (eb *EventBatch) GetTabletWorkerMetadataUpdateQuery(migrationUUID uuid.UUID) string {
+	queryTemplate := `UPDATE %s 
+	SET 
+		last_applied_vsn=%d, 
+		total_events = total_events + %d, 
+		num_inserts = num_inserts + %d, 
+		num_updates = num_updates + %d, 
+		num_deletes = num_deletes + %d  
+	where 
+		migration_uuid='%s' AND table_name='%s' AND tablet_id='%s'
+	`
+	return fmt.Sprintf(queryTemplate,
+		TABLET_WORKERS_METADATA_TABLE_NAME,
+		eb.GetLastVsn(),
+		eb.EventCounts.TotalEvents,
+		eb.EventCounts.NumInserts,
+		eb.EventCounts.NumUpdates,
+		eb.EventCounts.NumDeletes,
+		migrationUUID, eb.TabletWorker.TableName, eb.TabletWorker.TabletID)
 }
 
 func (eb *EventBatch) GetQueriesToUpdateEventStatsByTable(migrationUUID uuid.UUID, tableNameTup sqlname.NameTuple) string {

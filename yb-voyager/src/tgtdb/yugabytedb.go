@@ -511,6 +511,11 @@ const BATCH_METADATA_TABLE_SCHEMA = "ybvoyager_metadata"
 const BATCH_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_batches_metainfo_v3"
 const EVENT_CHANNELS_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_event_channels_metainfo"
 const EVENTS_PER_TABLE_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_imported_event_count_by_table"
+
+// TABLET_WORKERS_METADATA_TABLE_NAME tracks per-(table, tablet) apply watermarks and
+// counters for the tablet-affine CDC partitioning strategy. It is additive: the
+// pk/table strategies continue to use EVENT_CHANNELS_METADATA_TABLE_NAME.
+const TABLET_WORKERS_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_tablet_workers_metainfo"
 const YB_DEFAULT_CORES_PER_NODE = 16 // assumed vCPUs per node when core detection fails
 const ALTER_QUERY_RETRY_COUNT = 5
 
@@ -543,6 +548,17 @@ func (yb *TargetYugabyteDB) CreateVoyagerSchema() error {
 			num_deletes BIGINT,
 			num_updates BIGINT,
 			PRIMARY KEY (migration_uuid, table_name, channel_no));`, EVENTS_PER_TABLE_METADATA_TABLE_NAME),
+		fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
+			migration_uuid uuid,
+			table_name TEXT,
+			tablet_id TEXT,
+			last_applied_vsn BIGINT,
+			total_events BIGINT,
+			num_inserts BIGINT,
+			num_deletes BIGINT,
+			num_updates BIGINT,
+			active BOOLEAN,
+			PRIMARY KEY (migration_uuid, table_name, tablet_id));`, TABLET_WORKERS_METADATA_TABLE_NAME),
 	}
 
 	maxAttempts := 12
@@ -1206,34 +1222,47 @@ func (yb *TargetYugabyteDB) ExecuteBatch(migrationUUID uuid.UUID, batch *EventBa
 			return false, err
 		}
 
-		updateVsnQuery := batch.GetChannelMetadataUpdateQuery(migrationUUID)
-		res, err = tx.Exec(context.Background(), updateVsnQuery)
-		if err != nil || res.RowsAffected() == 0 {
-			log.Errorf("error executing stmt for batch(%s): %v, rowsAffected: %v", batch.ID(), err, res.RowsAffected())
-			return false, fmt.Errorf("failed to update vsn on target db via query-%s: %w, rowsAffected: %v",
-				updateVsnQuery, err, res.RowsAffected())
-		}
-		log.Debugf("Updated event channel meta info with query = %s; rows Affected = %d", updateVsnQuery, res.RowsAffected())
-
-		tableNames := batch.GetTableNames()
-		for _, tableName := range tableNames {
-			updateTableStatsQuery := batch.GetQueriesToUpdateEventStatsByTable(migrationUUID, tableName)
-			res, err = tx.Exec(context.Background(), updateTableStatsQuery)
-			if err != nil {
-				log.Errorf("error executing stmt: %v, rowsAffected: %v", err, res.RowsAffected())
-				return false, fmt.Errorf("failed to update table stats on target db via query-%s: %w, rowsAffected: %v",
-					updateTableStatsQuery, err, res.RowsAffected())
+		if batch.IsTabletBatch() {
+			// Tablet-affine strategy: advance the per-(table, tablet) watermark + counters
+			// in a single row of the tablet-workers metadata table (same TX as the DMLs).
+			updateVsnQuery := batch.GetTabletWorkerMetadataUpdateQuery(migrationUUID)
+			res, err = tx.Exec(context.Background(), updateVsnQuery)
+			if err != nil || res.RowsAffected() == 0 {
+				log.Errorf("error executing stmt for batch(%s): %v, rowsAffected: %v", batch.ID(), err, res.RowsAffected())
+				return false, fmt.Errorf("failed to update tablet worker meta on target db via query-%s: %w, rowsAffected: %v",
+					updateVsnQuery, err, res.RowsAffected())
 			}
-			if res.RowsAffected() == 0 {
-				insertTableStatsQuery := batch.GetQueriesToInsertEventStatsByTable(migrationUUID, tableName)
-				res, err = tx.Exec(context.Background(), insertTableStatsQuery)
+			log.Debugf("Updated tablet worker meta info with query = %s; rows Affected = %d", updateVsnQuery, res.RowsAffected())
+		} else {
+			updateVsnQuery := batch.GetChannelMetadataUpdateQuery(migrationUUID)
+			res, err = tx.Exec(context.Background(), updateVsnQuery)
+			if err != nil || res.RowsAffected() == 0 {
+				log.Errorf("error executing stmt for batch(%s): %v, rowsAffected: %v", batch.ID(), err, res.RowsAffected())
+				return false, fmt.Errorf("failed to update vsn on target db via query-%s: %w, rowsAffected: %v",
+					updateVsnQuery, err, res.RowsAffected())
+			}
+			log.Debugf("Updated event channel meta info with query = %s; rows Affected = %d", updateVsnQuery, res.RowsAffected())
+
+			tableNames := batch.GetTableNames()
+			for _, tableName := range tableNames {
+				updateTableStatsQuery := batch.GetQueriesToUpdateEventStatsByTable(migrationUUID, tableName)
+				res, err = tx.Exec(context.Background(), updateTableStatsQuery)
 				if err != nil {
 					log.Errorf("error executing stmt: %v, rowsAffected: %v", err, res.RowsAffected())
-					return false, fmt.Errorf("failed to insert table stats on target db via query-%s: %w, rowsAffected: %v",
+					return false, fmt.Errorf("failed to update table stats on target db via query-%s: %w, rowsAffected: %v",
 						updateTableStatsQuery, err, res.RowsAffected())
 				}
+				if res.RowsAffected() == 0 {
+					insertTableStatsQuery := batch.GetQueriesToInsertEventStatsByTable(migrationUUID, tableName)
+					res, err = tx.Exec(context.Background(), insertTableStatsQuery)
+					if err != nil {
+						log.Errorf("error executing stmt: %v, rowsAffected: %v", err, res.RowsAffected())
+						return false, fmt.Errorf("failed to insert table stats on target db via query-%s: %w, rowsAffected: %v",
+							updateTableStatsQuery, err, res.RowsAffected())
+					}
+				}
+				log.Debugf("Updated table stats meta info with query = %s; rows Affected = %d", updateTableStatsQuery, res.RowsAffected())
 			}
-			log.Debugf("Updated table stats meta info with query = %s; rows Affected = %d", updateTableStatsQuery, res.RowsAffected())
 		}
 		if err = tx.Commit(ctx); err != nil {
 			return false, fmt.Errorf("failed to commit transaction : %w", err)

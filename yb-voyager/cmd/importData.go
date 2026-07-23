@@ -102,6 +102,10 @@ var maxConcurrentBatchProductionsConfig int = 10
 // live migration
 var cdcPartitioningStrategy string
 
+// tabletMetadataRefreshInterval is how often the tablet CDC partitioning strategy
+// re-polls yb_tablet_metadata to detect tablet splits and remap workers.
+var tabletMetadataRefreshInterval time.Duration
+
 var importDataCmd = &cobra.Command{
 	Use: "data",
 	Short: "Import data from compatible source database to target database.\n" +

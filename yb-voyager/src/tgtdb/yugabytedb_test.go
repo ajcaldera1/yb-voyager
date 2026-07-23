@@ -83,6 +83,17 @@ func TestCreateVoyagerSchemaYB(t *testing.T) {
 			"num_deletes":    {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
 			"num_updates":    {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
 		},
+		TABLET_WORKERS_METADATA_TABLE_NAME: {
+			"migration_uuid":   {Type: "uuid", IsNullable: "NO", Default: sql.NullString{Valid: false}, IsPrimary: true},
+			"table_name":       {Type: "text", IsNullable: "NO", Default: sql.NullString{Valid: false}, IsPrimary: true},
+			"tablet_id":        {Type: "text", IsNullable: "NO", Default: sql.NullString{Valid: false}, IsPrimary: true},
+			"last_applied_vsn": {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
+			"total_events":     {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
+			"num_inserts":      {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
+			"num_deletes":      {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
+			"num_updates":      {Type: "bigint", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
+			"active":           {Type: "boolean", IsNullable: "YES", Default: sql.NullString{Valid: false}, IsPrimary: false},
+		},
 	}
 
 	// Validate the schema and tables
@@ -1171,4 +1182,67 @@ func createTableToColumnsStructMap(schemaName string, tables map[string][]string
 		tableColumnsMap.Put(tableNameTup, columns)
 	}
 	return tableColumnsMap
+}
+
+// TestYugabyteTabletMetadataLayout is a smoke test for the tablet-affine CDC apply
+// path. It exercises the real yb_tablet_metadata / yb_hash_code queries against the
+// target cluster and is skipped automatically when the YugabyteDB version does not
+// expose yb_tablet_metadata (Early Access, ~2025.2+).
+func TestYugabyteTabletMetadataLayout(t *testing.T) {
+	yb, ok := testYugabyteDBTarget.TargetDB.(*TargetYugabyteDB)
+	require.True(t, ok, "expected testYugabyteDBTarget to be a *TargetYugabyteDB")
+
+	if !yb.IsTabletMetadataSupported() {
+		t.Skip("yb_tablet_metadata not available on this YugabyteDB version; skipping tablet-affinity smoke test")
+	}
+
+	testYugabyteDBTarget.ExecuteSqls(
+		`CREATE SCHEMA test_schema;`,
+		`CREATE TABLE test_schema.hash_t (
+			id INT,
+			name TEXT,
+			PRIMARY KEY (id HASH)
+		) SPLIT INTO 4 TABLETS;`,
+		`CREATE TABLE test_schema.range_t (
+			id INT,
+			name TEXT,
+			PRIMARY KEY (id ASC)
+		);`,
+	)
+	defer testYugabyteDBTarget.ExecuteSqls(`DROP SCHEMA test_schema CASCADE;`)
+
+	t.Run("hash-sharded table yields a routable tablet layout", func(t *testing.T) {
+		hashTable := testutils.CreateNameTupleWithTargetName("test_schema.hash_t", "public", YUGABYTEDB)
+		layout, err := yb.GetTableTabletLayout(hashTable)
+		require.NoError(t, err)
+		require.NotNil(t, layout)
+		assert.False(t, layout.RangeSharded, "hash-sharded table must not be marked range-sharded")
+		assert.Equal(t, []string{"id"}, layout.HashKeyColumns)
+		require.NotEmpty(t, layout.Tablets, "expected at least one tablet")
+
+		// Tablets must be sorted by start hash, non-overlapping, and cover [0, YB_HASH_CODE_MAX).
+		assert.Equal(t, 0, layout.Tablets[0].StartHashCode)
+		assert.Equal(t, YB_HASH_CODE_MAX, layout.Tablets[len(layout.Tablets)-1].EndHashCode)
+		for i := 1; i < len(layout.Tablets); i++ {
+			assert.LessOrEqual(t, layout.Tablets[i-1].StartHashCode, layout.Tablets[i].StartHashCode,
+				"tablets must be sorted by start hash code")
+			assert.Equal(t, layout.Tablets[i-1].EndHashCode, layout.Tablets[i].StartHashCode,
+				"tablet ranges must be contiguous")
+		}
+
+		// ComputeHashCode must return a value inside the DocDB hash space.
+		idVal := "42"
+		hc, err := yb.ComputeHashCode(layout, map[string]*string{"id": &idVal})
+		require.NoError(t, err)
+		assert.GreaterOrEqual(t, hc, 0)
+		assert.Less(t, hc, YB_HASH_CODE_MAX)
+	})
+
+	t.Run("range-sharded table is reported as ineligible", func(t *testing.T) {
+		rangeTable := testutils.CreateNameTupleWithTargetName("test_schema.range_t", "public", YUGABYTEDB)
+		layout, err := yb.GetTableTabletLayout(rangeTable)
+		require.NoError(t, err)
+		require.NotNil(t, layout)
+		assert.True(t, layout.RangeSharded, "range-sharded table must be flagged RangeSharded")
+	})
 }

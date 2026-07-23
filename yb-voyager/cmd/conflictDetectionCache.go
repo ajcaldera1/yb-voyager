@@ -127,6 +127,9 @@ type ConflictDetectionCache struct {
 	tableToUniqueKeyColumns *utils.StructMap[sqlname.NameTuple, []string]
 	evChans                 []chan *tgtdb.Event
 	sourceDBType            string
+	// flushHook, if set, is invoked alongside the channel flush when a conflict is
+	// detected, so tablet-affine workers also apply their pending batches promptly.
+	flushHook func()
 }
 
 func NewConflictDetectionCache(tableToUniqueKeyColumns *utils.StructMap[sqlname.NameTuple, []string], evChans []chan *tgtdb.Event, sourceDBType string) *ConflictDetectionCache {
@@ -137,6 +140,14 @@ func NewConflictDetectionCache(tableToUniqueKeyColumns *utils.StructMap[sqlname.
 	c.sourceDBType = sourceDBType
 	c.evChans = evChans
 	return c
+}
+
+// SetFlushHook registers a callback invoked when a conflict wait flushes pending
+// batches. Used to also flush tablet-affine workers (tablet partitioning strategy).
+func (c *ConflictDetectionCache) SetFlushHook(hook func()) {
+	c.Lock()
+	defer c.Unlock()
+	c.flushHook = hook
 }
 
 func (c *ConflictDetectionCache) Put(event *tgtdb.Event) {
@@ -166,6 +177,10 @@ retry:
 					// because MAX_EVENTS_PER_BATCH would likely be reached in the next batch.
 					log.Infof("channel %d is full with size %d, not sending FLUSH_BATCH_EVENT", i, len(c.evChans[i]))
 				}
+			}
+			// Also flush tablet-affine workers, if any, so their pending batches apply.
+			if c.flushHook != nil {
+				c.flushHook()
 			}
 			log.Infof("waiting for event(vsn=%d) to be complete before processing event(vsn=%d)", cachedEvent.Vsn, incomingEvent.Vsn)
 			// wait will release the lock and wait for a broadcast signal

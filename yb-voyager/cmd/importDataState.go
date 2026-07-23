@@ -48,6 +48,7 @@ const (
 	BATCH_METADATA_TABLE_NAME            = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_batches_metainfo_v3"
 	EVENT_CHANNELS_METADATA_TABLE_NAME   = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_event_channels_metainfo"
 	EVENTS_PER_TABLE_METADATA_TABLE_NAME = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_imported_event_count_by_table"
+	TABLET_WORKERS_METADATA_TABLE_NAME   = BATCH_METADATA_TABLE_SCHEMA + "." + "ybvoyager_import_data_tablet_workers_metainfo"
 )
 
 /*
@@ -332,15 +333,15 @@ func (s *ImportDataState) getBatches(filePath string, tableNameTup sqlname.NameT
 				continue
 			}
 			batch := &Batch{
-				SchemaName:    "",
-				TableNameTup:  tableNameTup,
-				FilePath:      filepath.Join(fileStateDir, file.Name()),
-				BaseFilePath:  filePath,
-				Number:        batchNum,
-				LineOffsetStart: offsetEnd - recordCount,
-				LineOffsetEnd:   offsetEnd,
-				ByteCount:     byteCount,
-				RecordCount:   recordCount,
+				SchemaName:       "",
+				TableNameTup:     tableNameTup,
+				FilePath:         filepath.Join(fileStateDir, file.Name()),
+				BaseFilePath:     filePath,
+				Number:           batchNum,
+				LineOffsetStart:  offsetEnd - recordCount,
+				LineOffsetEnd:    offsetEnd,
+				ByteCount:        byteCount,
+				RecordCount:      recordCount,
 				CumByteOffsetEnd: cumByteOffsetEnd,
 			}
 			result = append(result, batch)
@@ -455,7 +456,104 @@ func (s *ImportDataState) GetTotalNumOfEventsImportedByType(migrationUUID uuid.U
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("error in getting import stats from target db: %w", err)
 	}
+
+	// Also account for events applied by tablet-affine workers (tablet strategy),
+	// which record their counters in a separate metadata table.
+	tabletInserts, tabletUpdates, tabletDeletes, err := s.getTabletWorkerEventCounts(migrationUUID)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("error in getting tablet worker import stats from target db: %w", err)
+	}
+	return numInserts + tabletInserts, numUpdates + tabletUpdates, numDeletes + tabletDeletes, nil
+}
+
+func (s *ImportDataState) getTabletWorkerEventCounts(migrationUUID uuid.UUID) (int64, int64, int64, error) {
+	query := fmt.Sprintf("SELECT COALESCE(SUM(num_inserts),0), COALESCE(SUM(num_updates),0), COALESCE(SUM(num_deletes),0) FROM %s where migration_uuid='%s'",
+		TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID)
+	var numInserts, numUpdates, numDeletes int64
+	err := tdb.QueryRow(query).Scan(&numInserts, &numUpdates, &numDeletes)
+	if err != nil {
+		return 0, 0, 0, err
+	}
 	return numInserts, numUpdates, numDeletes, nil
+}
+
+// InitTabletWorker ensures a metadata row exists for the (table, tablet) worker and
+// returns its persisted last_applied_vsn (-1 for a brand-new tablet). The row is
+// inserted with active=true; existing rows are left untouched (idempotent resume).
+func (s *ImportDataState) InitTabletWorker(migrationUUID uuid.UUID, tableNameTup sqlname.NameTuple, tabletID string) (int64, error) {
+	lastAppliedVsn, found, err := s.getTabletWorkerLastAppliedVsnIfExists(migrationUUID, tableNameTup, tabletID)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		return lastAppliedVsn, nil
+	}
+	insertStmt := fmt.Sprintf("INSERT INTO %s VALUES ('%s', '%s', '%s', -1, 0, 0, 0, 0, true)",
+		TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID, tableNameTup.ForKey(), tabletID)
+	_, err = tdb.Exec(insertStmt)
+	if err != nil {
+		return 0, fmt.Errorf("error executing stmt - %v: %w", insertStmt, err)
+	}
+	log.Infof("created tablet worker meta info: %s", insertStmt)
+	return -1, nil
+}
+
+func (s *ImportDataState) getTabletWorkerLastAppliedVsnIfExists(migrationUUID uuid.UUID, tableNameTup sqlname.NameTuple, tabletID string) (int64, bool, error) {
+	query := fmt.Sprintf("SELECT last_applied_vsn FROM %s WHERE migration_uuid='%s' AND table_name='%s' AND tablet_id='%s'",
+		TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID, tableNameTup.ForKey(), tabletID)
+	var lastAppliedVsn int64
+	err := tdb.QueryRow(query).Scan(&lastAppliedVsn)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, fmt.Errorf("error executing stmt - %v: %w", query, err)
+	}
+	return lastAppliedVsn, true, nil
+}
+
+// GetTabletWorkerLastAppliedVsn returns the committed watermark for a tablet worker,
+// or -1 if no row exists.
+func (s *ImportDataState) GetTabletWorkerLastAppliedVsn(migrationUUID uuid.UUID, tableNameTup sqlname.NameTuple, tabletID string) (int64, error) {
+	lastAppliedVsn, found, err := s.getTabletWorkerLastAppliedVsnIfExists(migrationUUID, tableNameTup, tabletID)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return -1, nil
+	}
+	return lastAppliedVsn, nil
+}
+
+// SeedTabletWorkerWatermark creates a child tablet's metadata row inheriting the
+// given watermark (from its split parents). If the row already exists (e.g. resume),
+// it is left untouched to avoid regressing an already-advanced watermark.
+func (s *ImportDataState) SeedTabletWorkerWatermark(migrationUUID uuid.UUID, tableNameTup sqlname.NameTuple, tabletID string, inheritedVsn int64) error {
+	_, found, err := s.getTabletWorkerLastAppliedVsnIfExists(migrationUUID, tableNameTup, tabletID)
+	if err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	insertStmt := fmt.Sprintf("INSERT INTO %s VALUES ('%s', '%s', '%s', %d, 0, 0, 0, 0, true)",
+		TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID, tableNameTup.ForKey(), tabletID, inheritedVsn)
+	_, err = tdb.Exec(insertStmt)
+	if err != nil {
+		return fmt.Errorf("error executing stmt - %v: %w", insertStmt, err)
+	}
+	return nil
+}
+
+// MarkTabletWorkerInactive flags a retired (parent) tablet's row as inactive.
+func (s *ImportDataState) MarkTabletWorkerInactive(migrationUUID uuid.UUID, tableNameTup sqlname.NameTuple, tabletID string) error {
+	stmt := fmt.Sprintf("UPDATE %s SET active=false WHERE migration_uuid='%s' AND table_name='%s' AND tablet_id='%s'",
+		TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID, tableNameTup.ForKey(), tabletID)
+	_, err := tdb.Exec(stmt)
+	if err != nil {
+		return fmt.Errorf("error executing stmt - %v: %w", stmt, err)
+	}
+	return nil
 }
 
 func (s *ImportDataState) InitLiveMigrationState(migrationUUID uuid.UUID, numChans int, startClean bool, tableNameTups []sqlname.NameTuple) error {
@@ -491,6 +589,23 @@ func (s *ImportDataState) InitLiveMigrationState(migrationUUID uuid.UUID, numCha
 		err = s.clearMigrationStateFromTable(evTblNt, migrationUUID)
 		if err != nil {
 			return fmt.Errorf("error clearing meta info for %s: %w", EVENTS_PER_TABLE_METADATA_TABLE_NAME, err)
+		}
+
+		// Tablet-affine workers (tablet strategy) keep their watermarks in a separate
+		// additive table; clear it too on start-clean so a fresh run re-seeds tablets.
+		tabletMetadataTbl := TABLET_WORKERS_METADATA_TABLE_NAME
+		if tconf.TargetDBType == ORACLE {
+			tabletMetadataTbl = strings.ToUpper(tabletMetadataTbl)
+		}
+		parts = strings.Split(tabletMetadataTbl, ".")
+		tabletMetadataTblName := sqlname.NewObjectName(tconf.TargetDBType, "public", parts[0], parts[1])
+		tabletNt := sqlname.NameTuple{
+			CurrentName: tabletMetadataTblName,
+			SourceName:  nil,
+			TargetName:  tabletMetadataTblName,
+		}
+		if err := s.clearMigrationStateFromTable(tabletNt, migrationUUID); err != nil {
+			return fmt.Errorf("error clearing meta info for %s: %w", TABLET_WORKERS_METADATA_TABLE_NAME, err)
 		}
 	}
 	err := s.initChannelMetaInfo(migrationUUID, numChans)
@@ -654,6 +769,17 @@ func (s *ImportDataState) GetEventChannelsMetaInfo(migrationUUID uuid.UUID) (map
 }
 
 func (s *ImportDataState) IsEventBatchAlreadyImported(batch *tgtdb.EventBatch, migrationUUID uuid.UUID) (bool, error) {
+	if batch.IsTabletBatch() {
+		query := fmt.Sprintf("SELECT last_applied_vsn FROM %s WHERE migration_uuid='%s' AND table_name='%s' AND tablet_id='%s'",
+			TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID, batch.TabletWorker.TableName, batch.TabletWorker.TabletID)
+		var lastAppliedVsn int64
+		err := tdb.QueryRow(query).Scan(&lastAppliedVsn)
+		if err != nil {
+			return false, err
+		}
+		return lastAppliedVsn >= batch.GetLastVsn(), nil
+	}
+
 	query := fmt.Sprintf("SELECT last_applied_vsn FROM %s WHERE migration_uuid='%s' AND channel_no=%d",
 		EVENT_CHANNELS_METADATA_TABLE_NAME, migrationUUID, batch.ChanNo)
 	var lastAppliedVsnInChan int64
@@ -839,15 +965,15 @@ func (bw *BatchWriter) Done(isLastBatch bool, offsetEnd int64, byteCount int64, 
 		return nil, goerrors.Errorf("rename %q to %q: %s", tmpFileName, batchFilePath, err)
 	}
 	batch := &Batch{
-		SchemaName:    "",
-		TableNameTup:  bw.tableName,
-		FilePath:      batchFilePath,
-		BaseFilePath:  bw.filePath,
-		Number:        batchNumber,
-		LineOffsetStart: offsetEnd - bw.NumRecordsWritten,
-		LineOffsetEnd:   offsetEnd,
-		RecordCount:   bw.NumRecordsWritten,
-		ByteCount:     byteCount,
+		SchemaName:       "",
+		TableNameTup:     bw.tableName,
+		FilePath:         batchFilePath,
+		BaseFilePath:     bw.filePath,
+		Number:           batchNumber,
+		LineOffsetStart:  offsetEnd - bw.NumRecordsWritten,
+		LineOffsetEnd:    offsetEnd,
+		RecordCount:      bw.NumRecordsWritten,
+		ByteCount:        byteCount,
 		CumByteOffsetEnd: cumByteOffsetEnd,
 	}
 	return batch, nil
@@ -861,17 +987,17 @@ const (
 )
 
 type Batch struct {
-	Number        int64
-	TableNameTup  sqlname.NameTuple
-	SchemaName    string
-	FilePath      string // Path of the batch file.
-	BaseFilePath  string // Path of the original data file.
-	LineOffsetStart int64
-	LineOffsetEnd   int64
-	RecordCount   int64
-	ByteCount     int64
+	Number           int64
+	TableNameTup     sqlname.NameTuple
+	SchemaName       string
+	FilePath         string // Path of the batch file.
+	BaseFilePath     string // Path of the original data file.
+	LineOffsetStart  int64
+	LineOffsetEnd    int64
+	RecordCount      int64
+	ByteCount        int64
 	CumByteOffsetEnd int64 // Absolute byte position in the original data file after this batch.
-	Interrupted   bool
+	Interrupted      bool
 }
 
 func (batch *Batch) Open() (*os.File, error) {

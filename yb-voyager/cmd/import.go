@@ -18,6 +18,7 @@ package cmd
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	goerrors "github.com/go-errors/errors"
 	"github.com/samber/lo"
@@ -149,7 +150,7 @@ func validateImportUsePartitionRootFlag() error {
 	})
 }
 
-var validCdcPartitioningStrategies = []string{"pk", "table", "auto"}
+var validCdcPartitioningStrategies = []string{"pk", "table", "auto", "tablet"}
 
 func validateCdcPartitioningStrategyFlag(cmd *cobra.Command) error {
 	if importerRole != TARGET_DB_IMPORTER_ROLE {
@@ -366,11 +367,16 @@ Note that for the cases where a table doesn't have a primary key, this may lead 
 	cmd.Flags().MarkHidden("enable-random-batch-production")
 
 	cmd.Flags().StringVar(&cdcPartitioningStrategy, "cdc-partitioning-strategy", "auto",
-		`The desired partitioning strategy to use while importing cdc events parallelly. The supported values are: pk, table. (default auto-detect)
-		\tauto: Automatically detect the partitioning strategy based on the table having expression or normal unique indexes.
+		`The desired partitioning strategy to use while importing cdc events parallelly. The supported values are: pk, table, tablet. (default auto-detect)
+		\tauto: Automatically detect the partitioning strategy per table (picks tablet when eligible on YugabyteDB, else pk, else table for expression/normal unique indexes).
 		\tpk: Partition the cdc events by primary key.
-		\ttable: Partition the cdc events by table.`)
+		\ttable: Partition the cdc events by table.
+		\ttablet: Partition the cdc events by tablet (tablet-affine apply workers) for eligible hash-sharded YugabyteDB tables; ineligible tables fall back to pk.`)
 	cmd.Flags().MarkHidden("cdc-partitioning-strategy")
+
+	cmd.Flags().DurationVar(&tabletMetadataRefreshInterval, "tablet-metadata-refresh-interval", 30*time.Second,
+		"How often to re-poll yb_tablet_metadata to detect tablet splits when using the tablet cdc-partitioning-strategy (default 30s)")
+	cmd.Flags().MarkHidden("tablet-metadata-refresh-interval")
 
 	cmd.Flags().IntVar(&prometheusMetricsPort, "prometheus-metrics-port", 0,
 		"Port for Prometheus metrics server (default: 9101)")
