@@ -774,6 +774,12 @@ func (s *ImportDataState) IsEventBatchAlreadyImported(batch *tgtdb.EventBatch, m
 			TABLET_WORKERS_METADATA_TABLE_NAME, migrationUUID, batch.TabletWorker.TableName, batch.TabletWorker.TabletID)
 		var lastAppliedVsn int64
 		err := tdb.QueryRow(query).Scan(&lastAppliedVsn)
+		if err == sql.ErrNoRows {
+			// Missing tablet-worker row means nothing has been applied yet for this
+			// (table, tablet); treat as "not imported" so the retry path can proceed
+			// instead of crashing via ErrExit.
+			return false, nil
+		}
 		if err != nil {
 			return false, err
 		}
