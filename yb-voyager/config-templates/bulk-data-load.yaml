@@ -78,17 +78,29 @@ import-data-file:
   ### for AWS S3, e.g. s3://<bucket-name>/<path-to-data-dir>
   ### for GCS buckets, e.g. gs://<bucket-name>/<path-to-data-dir>
   ### for Azure blob storage, e.g. https://<account_name>.blob.core.windows.net/<container_name>/<path-to-data-dir>
+  ### For format 'pgdump', this is the local path to an existing pg_dump backup:
+  ###   a directory-format dump directory, or a custom/plain-SQL dump file.
   data-dir: <data-dir-path>
 
   ### Comma-separated list mapping each file name in 'data-dir' to its corresponding table in the database.
   ### You can import multiple files in one table either:
   ###   by providing one entry for each file 'fileName1:tableName,fileName2:tableName', or 
   ###   by passing a glob expression in place of the file name. 'fileName*:tableName'
+  ### Note: required for csv/text formats; not applicable to the 'pgdump' format
+  ###   (the mapping is derived automatically from the backup).
   file-table-map: "file1.csv:table1,file2.csv:table2"
 
   ### Format of the data file to be imported
   ### Default - "csv"
-  ### Accepted values: (csv,text) 
+  ### Accepted values: (csv,text,pgdump)
+  ### - csv/text: plain data files described by file-table-map.
+  ### - pgdump: data-dir points at an existing PostgreSQL pg_dump backup
+  ###     (directory, custom, or plain-SQL format). The backup is normalized into
+  ###     tab-delimited TEXT files and imported automatically; sequence values in
+  ###     the backup are restored after import. Import the schema first.
+  ###     Recommended pg_dump flags when creating the backup:
+  ###       pg_dump --data-only --format=directory --no-owner --no-privileges \
+  ###         --no-tablespaces --load-via-partition-root --no-blobs --compress=0 -f <dir>
   # format: csv
 
   ### Character used as delimiter in rows of the table(s) 

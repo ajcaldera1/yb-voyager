@@ -17,6 +17,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -32,6 +33,8 @@ import (
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/datastore"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/metadb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/namereg"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/pgdump"
+	"github.com/yugabyte/yb-voyager/yb-voyager/src/srcdb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/tgtdb"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/types"
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils"
@@ -41,13 +44,19 @@ import (
 	"github.com/yugabyte/yb-voyager/yb-voyager/src/utils/sqlname"
 )
 
+// PGDUMP is a CLI-only value for the --format flag of `import data file`. It
+// indicates that --data-dir points at an existing pg_dump backup (directory,
+// custom, or plain-SQL format). The backup is normalized into tab-delimited
+// TEXT data files, so internally the import proceeds as datafile.TEXT.
+const PGDUMP = "pgdump"
+
 var (
 	fileFormat            string
 	delimiter             string
 	dataDir               string
 	fileTableMapping      string
 	hasHeader             utils.BoolStr
-	supportedFileFormats  = []string{datafile.CSV, datafile.TEXT}
+	supportedFileFormats  = []string{datafile.CSV, datafile.TEXT, PGDUMP}
 	fileOpts              string
 	escapeChar            string
 	quoteChar             string
@@ -55,11 +64,16 @@ var (
 	supportedCsvFileOpts  = []string{"escape_char", "quote_char"}
 	dataStore             datastore.DataStore
 	reportProgressInBytes bool
+	// pgDumpTableToColumns maps a target table (ForKey) to the ordered column
+	// list parsed from the pg_dump COPY statements. It is populated only for the
+	// --format pgdump path and is nil otherwise.
+	pgDumpTableToColumns map[string][]string
 )
 
 var importDataFileCmd = &cobra.Command{
 	Use: "file",
 	Short: "This command imports data from given files into YugabyteDB database. The files can be present either in local directories or cloud storages like AWS S3, GCS buckets and Azure blob storage. Incremental data load is also supported.\n" +
+		"With --format pgdump, an existing PostgreSQL pg_dump backup (directory, custom, or plain-SQL format) can be imported directly without a live source database (import the schema first).\n" +
 		"For more details and examples, visit https://docs.yugabyte.com/preview/yugabyte-voyager/migrate/bulk-data-load/",
 
 	PreRun: func(cmd *cobra.Command, args []string) {
@@ -96,6 +110,9 @@ var importDataFileCmd = &cobra.Command{
 	},
 
 	Run: func(cmd *cobra.Command, args []string) {
+		if fileFormat == PGDUMP {
+			convertPgDumpBackup()
+		}
 		dataStore = datastore.NewDataStore(dataDir)
 		storeFileTableMapAndDataDirInMSR()
 		importFileTasks := getImportFileTasks(fileTableMapping)
@@ -152,6 +169,12 @@ func prepareForImportDataCmd(importFileTasks []*ImportFileTask) {
 		escapeCharBytes := []byte(escapeChar)
 		dataFileDescriptor.EscapeChar = escapeCharBytes[0]
 	}
+	if len(pgDumpTableToColumns) > 0 {
+		// For the pgdump path, column lists come from the dump's COPY statements
+		// rather than a header row, so the COPY into YugabyteDB targets exactly
+		// the columns present in the backup.
+		dataFileDescriptor.TableNameToExportedColumns = pgDumpTableToColumns
+	}
 
 	escapeFileOptsCharsIfRequired() // escaping for COPY command should be done after saving fileOpts in data file descriptor
 	setImportTableListFlag(importFileTasks)
@@ -183,6 +206,98 @@ func setImportTableListFlag(importFileTasks []*ImportFileTask) {
 		tableList[task.TableNameTup.ForKey()] = true
 	}
 	tconf.TableList = strings.Join(maps.Keys(tableList), ",")
+}
+
+// convertPgDumpBackup normalizes the pg_dump backup pointed to by --data-dir
+// into tab-delimited TEXT data files under the export dir, then rewires the
+// import-data-file flags (format, delimiter, null-string, data-dir,
+// file-table-map) so the rest of the command runs through the existing TEXT
+// import path. Sequence setval statements are written to data/postdata.sql so
+// they are restored after snapshot import.
+func convertPgDumpBackup() {
+	pgDumpSourcePath := dataDir
+	normalizedDir := filepath.Join(exportDir, "data", "pgdump_data")
+
+	format, err := pgdump.DetectFormat(pgDumpSourcePath)
+	if err != nil {
+		utils.ErrExit("detecting pg_dump backup format: %v", err)
+	}
+
+	var pgRestorePath string
+	if format != pgdump.DumpFormatPlain {
+		var binaryCheckIssue string
+		pgRestorePath, binaryCheckIssue, err = srcdb.GetAbsPathOfPGCommandAboveVersion("pg_restore", "")
+		if err != nil {
+			utils.ErrExit("could not get absolute path of pg_restore command: %v", err)
+		} else if binaryCheckIssue != "" {
+			utils.ErrExit("pg_restore is required to import a %s-format pg_dump backup: %s", format, binaryCheckIssue)
+		}
+	}
+
+	utils.PrintAndLogf("Normalizing %s-format pg_dump backup from %q ...", format, pgDumpSourcePath)
+	result, err := pgdump.Normalize(pgDumpSourcePath, normalizedDir, pgRestorePath)
+	if err != nil {
+		utils.ErrExit("normalizing pg_dump backup: %v", err)
+	}
+
+	pgDumpTableToColumns = make(map[string][]string)
+	var mappingEntries []string
+	skippedTables := map[string]bool{}
+	for _, table := range result.Tables {
+		tableNameTuple, err := namereg.NameReg.LookupTableName(table.QualifiedName)
+		if err != nil {
+			// The dump can contain tables that were not created on the target
+			// (e.g. different schema scope). Skip them with a warning instead of
+			// failing the whole import.
+			if !skippedTables[table.QualifiedName] {
+				utils.PrintAndLogf("WARNING: skipping table %q from the pg_dump backup: not found on target: %v", table.QualifiedName, err)
+				skippedTables[table.QualifiedName] = true
+			}
+			continue
+		}
+		mappingEntries = append(mappingEntries, fmt.Sprintf("%s:%s", filepath.Base(table.FilePath), table.QualifiedName))
+		if _, ok := pgDumpTableToColumns[tableNameTuple.ForKey()]; !ok && len(table.Columns) > 0 {
+			pgDumpTableToColumns[tableNameTuple.ForKey()] = table.Columns
+		}
+	}
+
+	if len(mappingEntries) == 0 {
+		utils.ErrExit("no tables from the pg_dump backup could be matched to tables on the target database. Ensure the schema has been imported before importing data.")
+	}
+
+	writePgDumpSequencePostData(result.SetvalStatements)
+
+	// Rewire flags so the import proceeds through the TEXT path.
+	fileFormat = datafile.TEXT
+	delimiter = "\t"
+	nullString = `\N`
+	dataDir = normalizedDir
+	fileTableMapping = strings.Join(mappingEntries, ",")
+	log.Infof("pg_dump backup normalized: format=%s, tables=%d, dataDir=%q", format, len(mappingEntries), dataDir)
+
+	err = metaDB.UpdateMigrationStatusRecord(func(msr *metadb.MigrationStatusRecord) {
+		msr.ImportDataFileFlagFormat = PGDUMP
+		msr.ImportDataFilePgDumpSourcePath = pgDumpSourcePath
+	})
+	if err != nil {
+		utils.ErrExit("failed updating migration status record for pg_dump import metadata: %v", err)
+	}
+}
+
+// writePgDumpSequencePostData writes the sequence setval statements extracted
+// from the dump to data/postdata.sql so that restoreSequencesInOfflineMigration
+// can restore sequence last-values after the snapshot import completes.
+func writePgDumpSequencePostData(setvalStatements []string) {
+	postDataPath := filepath.Join(exportDir, "data", "postdata.sql")
+	if len(setvalStatements) == 0 {
+		utils.PrintAndLogf("Note: no sequence values found in the pg_dump backup; sequences will not be restored automatically.")
+		return
+	}
+	content := strings.Join(setvalStatements, "\n") + "\n"
+	if err := os.WriteFile(postDataPath, []byte(content), 0644); err != nil {
+		utils.ErrExit("writing sequence post-data file %q: %v", postDataPath, err)
+	}
+	log.Infof("wrote %d sequence setval statement(s) to %q", len(setvalStatements), postDataPath)
 }
 
 func getImportFileTasks(currFileTableMapping string) []*ImportFileTask {
@@ -227,11 +342,16 @@ func checkImportDataFileFlags(cmd *cobra.Command) {
 	fileFormat = strings.ToLower(fileFormat)
 	checkFileFormat()
 	checkDataDirFlag()
-	setDefaultForDelimiter()
-	checkDelimiterFlag()
-	checkHasHeader()
-	checkAndParseEscapeAndQuoteChar()
-	setDefaultForNullString()
+	if fileFormat == PGDUMP {
+		checkPgDumpFlags(cmd)
+	} else {
+		checkFileTableMappingRequired()
+		setDefaultForDelimiter()
+		checkDelimiterFlag()
+		checkHasHeader()
+		checkAndParseEscapeAndQuoteChar()
+		setDefaultForNullString()
+	}
 	getTargetPassword(cmd)
 	validateTargetPortRange()
 	validateTargetSchemaFlag()
@@ -240,6 +360,29 @@ func checkImportDataFileFlags(cmd *cobra.Command) {
 	err := validateImportDataFlags()
 	if err != nil {
 		utils.ErrExit("Error validating import data flags: %s", err.Error())
+	}
+}
+
+func checkFileTableMappingRequired() {
+	if fileTableMapping == "" {
+		utils.ErrExit(`Error required flag "file-table-map" not set`)
+	}
+}
+
+// checkPgDumpFlags validates flags for the --format pgdump path. The table
+// mapping and CSV/TEXT-specific options are not applicable because the backup
+// is normalized into tab-delimited TEXT files automatically.
+func checkPgDumpFlags(cmd *cobra.Command) {
+	for _, flagName := range []string{"file-table-map", "delimiter", "has-header", "escape-char", "quote-char", "file-opts", "null-string"} {
+		if cmd.Flags().Changed(flagName) {
+			utils.ErrExit("--%s is not applicable with --format %s; the backup is converted to tab-delimited TEXT automatically", flagName, PGDUMP)
+		}
+	}
+
+	for _, prefix := range []string{"s3://", "gs://", "https://"} {
+		if strings.HasPrefix(dataDir, prefix) {
+			utils.ErrExit("--format %s currently supports only a local --data-dir path, not cloud storage (%q)", PGDUMP, dataDir)
+		}
 	}
 }
 
@@ -484,13 +627,15 @@ func init() {
 	registerFlagsForTarget(importDataFileCmd)
 
 	importDataFileCmd.Flags().StringVar(&fileFormat, "format", "csv",
-		fmt.Sprintf("supported data file types: (%v)", strings.Join(supportedFileFormats, ",")))
+		fmt.Sprintf("supported data file types: (%v)\n", strings.Join(supportedFileFormats, ","))+
+			"\tpgdump: --data-dir points at an existing pg_dump backup (directory, custom, or plain-SQL format); it is converted and imported automatically.")
 
 	importDataFileCmd.Flags().StringVar(&delimiter, "delimiter", "",
 		`character used as delimiter in rows of the table(s) (default for csv: "," (comma), for TEXT: "\t" (tab) )`)
 
 	importDataFileCmd.Flags().StringVar(&dataDir, "data-dir", "",
 		"path to the directory which contains data files to import into table(s)\n"+
+			"For --format pgdump, this is the path to the pg_dump backup: a directory-format dump directory, or a custom/plain-SQL dump file.\n"+
 			"Note: data-dir can be a local directory or a cloud storage URL\n"+
 			"\tfor AWS S3, e.g. s3://<bucket-name>/<path-to-data-dir>\n"+
 			"\tfor GCS buckets, e.g. gs://<bucket-name>/<path-to-data-dir>\n"+
@@ -502,12 +647,9 @@ func init() {
 
 	importDataFileCmd.Flags().StringVar(&fileTableMapping, "file-table-map", "",
 		"comma separated list of mapping between file name in '--data-dir' to a table in database\n"+
-			"You can import multiple files in one table either by providing one entry for each file 'fileName1:tableName,fileName2:tableName' OR by passing a glob expression in place of the file name. 'fileName*:tableName'")
+			"You can import multiple files in one table either by providing one entry for each file 'fileName1:tableName,fileName2:tableName' OR by passing a glob expression in place of the file name. 'fileName*:tableName'\n"+
+			"Note: required for csv/text formats; ignored for the pgdump format (the mapping is derived from the backup).")
 
-	err = importDataFileCmd.MarkFlagRequired("file-table-map")
-	if err != nil {
-		utils.ErrExit("mark 'file-table-map' flag required: %v", err)
-	}
 	BoolVar(importDataFileCmd.Flags(), &hasHeader, "has-header", false,
 		"Indicate that the first line of data file is a header row (default false)\n"+
 			"(Note: only works for csv file type)")

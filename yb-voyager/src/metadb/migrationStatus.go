@@ -93,6 +93,8 @@ type MigrationStatusRecord struct {
 
 	ImportDataFileFlagFileTableMapping string `json:"ImportDataFileFlagFileTableMapping"` // Import data file command's file_table_mapping flag
 	ImportDataFileFlagDataDir          string `json:"ImportDataFileFlagDataDir"`          // Import data file command's data-dir flag
+	ImportDataFileFlagFormat           string `json:"ImportDataFileFlagFormat"`           // Import data file command's --format flag (e.g. csv, text, pgdump)
+	ImportDataFilePgDumpSourcePath     string `json:"ImportDataFilePgDumpSourcePath"`     // Original pg_dump backup path when --format pgdump is used
 
 	SourceColumnToSequenceMapping map[string]string `json:"SourceColumnToSequenceMapping"`
 	TargetColumnToSequenceMapping map[string]string `json:"TargetColumnToSequenceMapping"`

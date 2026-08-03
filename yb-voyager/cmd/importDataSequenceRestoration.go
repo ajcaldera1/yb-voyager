@@ -99,6 +99,13 @@ func restoreSequencesInOfflineMigration(msr *metadb.MigrationStatusRecord, impor
 		//if tables are not being filtered then ideally we should restore all sequences
 		err = sequenceTupleToLastValue.IterKV(func(sequenceTuple sqlname.NameTuple, lastValue int64) (bool, error) {
 			if !sequenceTuple.TargetTableAvailable() {
+				if importerRole == IMPORT_FILE_ROLE {
+					// For `import data file --format pgdump`, the backup can
+					// contain sequences that were not created on the target.
+					// Skip them with a warning instead of failing the import.
+					log.Warnf("sequence %q from the backup is not present in the target database; skipping", sequenceTuple.ForKey())
+					return true, nil
+				}
 				return false, goerrors.Errorf("sequence %q is not present in the target database", sequenceTuple.ForKey())
 			}
 			sequenceNameTupleToLastValueMap.Put(sequenceTuple, lastValue)
@@ -143,6 +150,12 @@ func shouldFilterSequences(sourceType string) bool {
 	if sourceType != POSTGRESQL {
 		return false
 	}
+	//for `import data file` there is no source column-to-sequence mapping to
+	//filter against (no live source), so restore all sequences found in the
+	//backup and rely on target availability checks.
+	if importerRole == IMPORT_FILE_ROLE {
+		return false
+	}
 	//if table list filteration is enabled, we filter sequences
 	return tconf.TableList != "" || tconf.ExcludeTableList != ""
 }
@@ -174,6 +187,12 @@ func fetchSequenceLastValueMap(msr *metadb.MigrationStatusRecord) (*utils.Struct
 	for sequenceName, lastValue := range sequenceLastValue {
 		sequenceTuple, err := namereg.NameReg.LookupTableNameAndIgnoreIfTargetNotFoundBasedOnRole(sequenceName)
 		if err != nil {
+			if importerRole == IMPORT_FILE_ROLE {
+				// The pg_dump backup can reference sequences that are not
+				// registered on the target; skip them rather than failing.
+				log.Warnf("skipping sequence %q from the backup: not found on target: %v", sequenceName, err)
+				continue
+			}
 			return nil, fmt.Errorf("error looking up sequence name %q: %w", sequenceName, err)
 		}
 		sequenceTupleToLastValueMap.Put(sequenceTuple, lastValue)

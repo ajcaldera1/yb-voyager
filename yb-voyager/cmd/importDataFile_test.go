@@ -747,3 +747,74 @@ func TestImportDataFile_SameFileForMultipleTables(t *testing.T) {
 		PercentageComplete: 100,
 	}, statusReport[1], "Status report row mismatch")
 }
+
+// TestImportDataFilePgDumpPlain verifies that `import data file --format pgdump`
+// can populate a YugabyteDB target from an existing plain-SQL pg_dump backup
+// (COPY blocks + setval statements) without a live source database, and that
+// sequence last-values are restored.
+func TestImportDataFilePgDumpPlain(t *testing.T) {
+	exportDir = testutils.CreateTempExportDir()
+	defer testutils.RemoveTempExportDir(exportDir)
+
+	setupYugabyteTestDb(t)
+
+	// Create the target schema objects first (schema import is a prerequisite).
+	testYugabyteDBTarget.TestContainer.ExecuteSqls(
+		`CREATE TABLE public.pgd_orders (id INTEGER PRIMARY KEY, name TEXT);`,
+		`CREATE SEQUENCE public.pgd_orders_id_seq;`,
+	)
+	t.Cleanup(func() {
+		testYugabyteDBTarget.TestContainer.ExecuteSqls(
+			"DROP TABLE IF EXISTS public.pgd_orders;",
+			"DROP SEQUENCE IF EXISTS public.pgd_orders_id_seq;",
+		)
+	})
+
+	// Write a plain-SQL pg_dump backup with a COPY data block (tab-delimited,
+	// \N null marker) and a sequence setval statement.
+	dumpDir := filepath.Join("/tmp", "pgd_plain_dump")
+	testutils.FatalIfError(t, os.MkdirAll(dumpDir, 0755), "Failed to create dump dir")
+	defer os.RemoveAll(dumpDir)
+	dumpFile := filepath.Join(dumpDir, "dump.sql")
+	dumpContent := "--\n-- PostgreSQL database dump\n--\n\n" +
+		"COPY public.pgd_orders (id, name) FROM stdin;\n" +
+		"1\tapple\n" +
+		"2\t\\N\n" +
+		"3\tcherry\n" +
+		"\\.\n\n" +
+		"SELECT pg_catalog.setval('public.pgd_orders_id_seq', 3, true);\n"
+	testutils.FatalIfError(t, os.WriteFile(dumpFile, []byte(dumpContent), 0644), "Failed to write plain SQL dump")
+
+	importDataFileCmdArgs := []string{
+		"--export-dir", exportDir,
+		"--disable-pb", "true",
+		"--target-db-schema", "public",
+		"--data-dir", dumpFile,
+		"--format", "pgdump",
+		"--yes",
+	}
+
+	err := testutils.NewVoyagerCommandRunner(testYugabyteDBTarget.TestContainer, "import data file", importDataFileCmdArgs, nil, false).Run()
+	testutils.FatalIfError(t, err, "import data file --format pgdump failed")
+
+	ybConn, err := testYugabyteDBTarget.TestContainer.GetConnection()
+	testutils.FatalIfError(t, err, "connecting to YugabyteDB")
+	defer ybConn.Close()
+
+	var rowCount int
+	err = ybConn.QueryRow("SELECT COUNT(*) FROM public.pgd_orders").Scan(&rowCount)
+	testutils.FatalIfError(t, err, "failed to query pgd_orders row count")
+	assert.Equal(t, 3, rowCount, "expected 3 rows imported from the pg_dump backup")
+
+	var nullName int
+	err = ybConn.QueryRow("SELECT COUNT(*) FROM public.pgd_orders WHERE name IS NULL").Scan(&nullName)
+	testutils.FatalIfError(t, err, "failed to query null name count")
+	assert.Equal(t, 1, nullName, "expected the \\N value to be imported as NULL")
+
+	// Sequence last-value should have been restored from the setval statement,
+	// so the next value must be greater than 3.
+	var nextVal int
+	err = ybConn.QueryRow("SELECT nextval('public.pgd_orders_id_seq')").Scan(&nextVal)
+	testutils.FatalIfError(t, err, "failed to query sequence nextval")
+	assert.Greater(t, nextVal, 3, "expected sequence to be restored to a value > 3")
+}
